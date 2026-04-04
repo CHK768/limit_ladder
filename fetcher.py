@@ -613,7 +613,7 @@ def fetch_range(
 # ─────────────────────── 历史涨停（日K反推）───────────────────────
 
 def _market_prefix(code: str) -> str:
-    """返回新浪 stock_zh_a_daily 所需前缀"""
+    """返回腾讯/新浪行情接口所需市场前缀"""
     if code.startswith(("6", "9")):
         return "sh"
     return "sz"
@@ -642,16 +642,20 @@ def _calc_zt_for_stock(
     end: str,
     needed_dates: frozenset,
 ) -> list[dict]:
-    """从日K数据计算某只股票在指定日期集合内的涨停记录"""
+    """从腾讯日K数据计算某只股票在指定日期集合内的涨停记录（不依赖 py_mini_racer）"""
     try:
-        prefix = _market_prefix(code)
-        df = ak.stock_zh_a_daily(
-            symbol=f"{prefix}{code}",
-            start_date=start,
-            end_date=end,
-            adjust="",
+        sym = f"{_market_prefix(code)}{code}"
+        url = (
+            f"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+            f"?_var=x&param={sym},day,,,600,&cb=&r=0.1"
         )
-        if df is None or df.empty:
+        resp = _req.get(url, timeout=15, verify=False)
+        text = resp.text
+        if text.startswith("x="):
+            text = text[2:]
+        raw = json.loads(text)
+        rows = raw.get("data", {}).get(sym, {}).get("day", [])
+        if not rows:
             return []
 
         limit_pct = _get_limit_pct(code, name)
@@ -659,31 +663,24 @@ def _calc_zt_for_stock(
         consecutive = 0
         prev_close = None
 
-        for _, row in df.iterrows():
+        for r in rows:
             try:
-                d = row["date"]
-                date_str = (
-                    d.strftime("%Y%m%d")
-                    if hasattr(d, "strftime")
-                    else str(d)[:10].replace("-", "")
-                )
-                close = float(row["close"])
-                high = float(row["high"])
-                shares = float(row.get("outstanding_share", 0) or 0)
-            except Exception:
+                date_str = str(r[0]).replace("-", "")[:8]
+                close = float(r[2])
+                high = float(r[3])
+                low = float(r[4])
+            except (IndexError, ValueError):
                 prev_close = None
                 consecutive = 0
                 continue
 
-            if prev_close is not None:
+            if prev_close is not None and date_str <= end:
                 limit_price = round(prev_close * (1 + limit_pct), 2)
                 is_zt = abs(close - limit_price) < 0.005 and abs(high - close) < 0.005
                 if is_zt:
                     consecutive += 1
                     if date_str in needed_dates:
-                        # 用当日流通股 × 收盘价算当日流通市值
-                        day_cap = round(shares * close / 1e8, 2) if shares > 0 else float_cap
-                        pct = round((close - prev_close) / prev_close * 100, 2) if prev_close > 0 else None
+                        pct = round((close - prev_close) / prev_close * 100, 2)
                         records.append({
                             "date": date_str,
                             "code": code,
@@ -691,7 +688,7 @@ def _calc_zt_for_stock(
                             "price": close,
                             "pct_change": pct,
                             "consecutive_days": consecutive,
-                            "float_cap": day_cap,
+                            "float_cap": float_cap,
                             "total_cap": total_cap,
                             "first_limit_time": None,
                             "last_limit_time": None,
