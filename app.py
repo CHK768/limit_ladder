@@ -2121,11 +2121,17 @@ class SectorTab(QWidget):
 
     @staticmethod
     def _fmt_net(val) -> str:
-        """将万元净买入格式化为亿元字符串"""
+        """将元净买入格式化为亿/万元字符串"""
         if val is None:
             return "—"
+        abs_val = abs(val)
         sign = "+" if val >= 0 else ""
-        return f"{sign}{val/10000:.1f}亿"
+        if abs_val >= 100_000_000:
+            return f"{sign}{val/100_000_000:.1f}亿"
+        elif abs_val >= 10_000:
+            return f"{sign}{val/10_000:.0f}万"
+        else:
+            return "—"
 
     def _fill_table(self, tbl: QTableWidget, dates: list[str],
                     day_data: dict[str, dict[str, dict]], mode: str,
@@ -2201,16 +2207,39 @@ class SectorTab(QWidget):
                     if stocks_by_date:
                         sector_stocks = (stocks_by_date.get(d) or {}).get(sector, [])
                         if sector_stocks:
+                            def _fmt_t(t: str) -> str:
+                                if len(t) >= 6:
+                                    return f"{t[:2]}:{t[2:4]}:{t[4:6]}"
+                                if len(t) >= 4:
+                                    return f"{t[:2]}:{t[2:4]}"
+                                return "—"
                             if mode == "zt":
-                                tip = "\n".join(
-                                    f"{s['name']}({s['code']})  {s.get('consecutive_days', 1)}板"
-                                    for s in sector_stocks
+                                sorted_ss = sorted(
+                                    sector_stocks,
+                                    key=lambda s: (
+                                        -(s.get("consecutive_days") or 1),
+                                        s.get("first_limit_time") or "999999",
+                                    ),
                                 )
+                                rows_h = "".join(
+                                    f"<tr>"
+                                    f"<td style='padding-right:8px'>{s['name']}</td>"
+                                    f"<td style='padding-right:8px;color:#888'>({s['code']})</td>"
+                                    f"<td style='text-align:right;padding-right:8px'>{s.get('consecutive_days',1)}板</td>"
+                                    f"<td>{_fmt_t(s.get('first_limit_time') or '')}</td>"
+                                    f"</tr>"
+                                    for s in sorted_ss
+                                )
+                                tip = f"<qt><table cellspacing='0' cellpadding='1' style='white-space:nowrap'>{rows_h}</table></qt>"
                             else:
-                                tip = "\n".join(
-                                    f"{s['name']}({s['code']})"
+                                rows_h = "".join(
+                                    f"<tr>"
+                                    f"<td style='padding-right:8px'>{s['name']}</td>"
+                                    f"<td style='color:#888'>({s['code']})</td>"
+                                    f"</tr>"
                                     for s in sector_stocks
                                 )
+                                tip = f"<qt><table cellspacing='0' cellpadding='1' style='white-space:nowrap'>{rows_h}</table></qt>"
                             cnt_item.setToolTip(tip)
                     # 只取最新日的龙头（首次遇到有数据的日期，即 dates[0]）
                     if not latest_leader:
@@ -2417,18 +2446,19 @@ class FactorTab(QWidget):
             for row in zt_by_date.get(d, []):
                 code = row["code"]
                 records.append({
-                    "date":          d,
-                    "code":          code,
-                    "name":          row.get("name", ""),
-                    "market":        _market(code),
-                    "float_cap":     row.get("float_cap"),
-                    "price":         row.get("price"),
-                    "pe":            row.get("pe"),
-                    "consecutive":   row.get("consecutive_days", 1),
-                    "concentration": cyq_by_date.get(d, {}).get(code),
-                    "concepts":      concept_map.get(code, []),
-                    "promoted":      (code in next_codes) if has_next else None,
-                    "has_next":      has_next,
+                    "date":           d,
+                    "code":           code,
+                    "name":           row.get("name", ""),
+                    "market":         _market(code),
+                    "float_cap":      row.get("float_cap"),
+                    "price":          row.get("price"),
+                    "pe":             row.get("pe"),
+                    "consecutive":    row.get("consecutive_days", 1),
+                    "concentration":  cyq_by_date.get(d, {}).get(code),
+                    "concepts":       concept_map.get(code, []),
+                    "promoted":       (code in next_codes) if has_next else None,
+                    "has_next":       has_next,
+                    "limit_time":     row.get("first_limit_time", ""),
                 })
 
         # 构建下周记录（extra_week 内部的次日晋级，用于因子组合下周表现对比）
@@ -2457,10 +2487,11 @@ class FactorTab(QWidget):
                     "price":         row.get("price"),
                     "pe":            row.get("pe"),
                     "consecutive":   row.get("consecutive_days", 1),
-                    "concentration": None,   # 不额外拉 CYQ
+                    "concentration": None,
                     "concepts":      nw_concept_map.get(code, []),
                     "promoted":      (code in nw_next_codes) if nw_has_next else None,
                     "has_next":      nw_has_next,
+                    "limit_time":    row.get("first_limit_time", ""),
                 })
 
         known_date_set = {r["date"] for r in records if r["has_next"]}
@@ -2535,24 +2566,60 @@ class FactorTab(QWidget):
         else:
             header = f"共 {total} 只（无{'下周' if week else '晋级'}数据）\n{'─' * 30}"
 
-        lines = [header]
         def sort_key(r):
-            if not r.get(hk): return 2
-            return 0 if r.get(pk) else 1
+            # 1级：连板(0) > 断板(1) > 无数据(2)
+            if not r.get(hk):   group = 2
+            elif r.get(pk):     group = 0
+            else:               group = 1
+            # 2级：板数降序（负值）
+            cons_neg = -(r.get("consecutive") or 1)
+            # 3级：日期降序（近的在前）
+            d = r.get("date", "") or ""
+            d_neg = -(int(d.replace("-", "")) if d else 0)
+            # 4级：涨停时间升序（HHMMSS 字典序即时间序）
+            t = r.get("limit_time") or "999999"
+            return (group, cons_neg, d_neg, t)
+
+        def fmt_time(t: str) -> str:
+            if len(t) >= 6:
+                return f"{t[:2]}:{t[2:4]}:{t[4:6]}"
+            if len(t) >= 4:
+                return f"{t[:2]}:{t[2:4]}"
+            return "—"
+
+        rows_html = []
         for r in sorted(grp, key=sort_key):
             code   = r["code"]
             name   = r["name"] or code
             cons   = r["consecutive"]
             d      = r["date"]
             date_s = f"{d[4:6]}/{d[6:8]}"
+            t_s    = fmt_time(r.get("limit_time") or "")
             if not r.get(hk):
-                mark = "  "
+                mark = "&nbsp;&nbsp;"
+                row_style = ""
             elif r.get(pk):
                 mark = "✓"
+                row_style = " style='color:#27ae60'"
             else:
                 mark = "✗"
-            lines.append(f"{mark} {code} {name}  {cons}板  {date_s}")
-        return "\n".join(lines)
+                row_style = " style='color:#e74c3c'"
+            rows_html.append(
+                f"<tr{row_style}>"
+                f"<td style='padding-right:6px'>{mark}</td>"
+                f"<td style='padding-right:6px'>{code}</td>"
+                f"<td style='padding-right:10px'>{name}</td>"
+                f"<td style='text-align:right;padding-right:10px'>{cons}板</td>"
+                f"<td style='padding-right:10px'>{date_s}</td>"
+                f"<td>{t_s}</td>"
+                f"</tr>"
+            )
+        table = "".join(rows_html)
+        return (
+            f"<qt><b>{header.replace(chr(10), '<br>')}</b>"
+            f"<hr style='margin:3px 0'>"
+            f"<table cellspacing='0' cellpadding='1' style='white-space:nowrap'>{table}</table></qt>"
+        )
 
     @staticmethod
     def _pearson(records: list[dict], key: str) -> float | None:
