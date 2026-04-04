@@ -140,7 +140,7 @@ class FetchWorker(QThread):
 
             # 补填历史日期缺失的 PE（按日期价格比例换算，各日期独立截面）
             if not self._stop:
-                dates_missing_pe = store.get_dates_missing_pe(days=90)
+                dates_missing_pe = store.get_dates_missing_pe(days=300)
                 for i, d in enumerate(dates_missing_pe):
                     if self._stop:
                         break
@@ -157,10 +157,10 @@ class FetchWorker(QThread):
                         if date_pe:
                             store.upsert_zt_pe(d, date_pe)
 
-            # 补填断板日涨跌幅（最近14天）
+            # 补填断板日涨跌幅（最近30天）
             if not self._stop:
                 all_zt_dates = sorted(store.get_dates_with_zt_data())  # 升序
-                recent = all_zt_dates[-14:] if len(all_zt_dates) > 14 else all_zt_dates
+                recent = all_zt_dates[-30:] if len(all_zt_dates) > 30 else all_zt_dates
                 for i in range(1, len(recent)):
                     if self._stop:
                         break
@@ -485,6 +485,7 @@ COL_W = CARD_W
 HEADER_H = 48  # 日期头（日期行 + 数量行）总高度
 
 BAND_HEADER_H = 24   # 板数分组标题行高度
+MAX_BAND = 7         # ≥7板合并到同一分组显示
 SEP_H = 1            # 分隔线高度
 
 class DayColumn(QWidget):
@@ -536,14 +537,14 @@ class DayColumn(QWidget):
         outer.addWidget(header)
         outer.addWidget(count_lbl)
 
-        # 按板数分组
+        # 按板数分组（≥MAX_BAND 的合并到 MAX_BAND 组）
         stocks_by_board: dict[int, list[dict]] = {}
         for s in stocks:
-            b = max(1, s.get("consecutive_days") or 1)
+            b = min(MAX_BAND, max(1, s.get("consecutive_days") or 1))
             stocks_by_board.setdefault(b, []).append(s)
 
-        # ── 各板数分组（高→低） ──
-        for boards in sorted(band_heights.keys(), reverse=True):
+        # ── 各板数分组（高→低）：若本列无股票则跳过空 band，断板区直接跟在 header 后 ──
+        for boards in sorted(band_heights.keys(), reverse=True) if stocks else []:
             bh = band_heights[boards]
             if bh <= 0:
                 continue
@@ -566,7 +567,8 @@ class DayColumn(QWidget):
             bhl.setContentsMargins(8, 0, 8, 0)
             bhl.setSpacing(5)
 
-            info_lbl = QLabel(f"{boards}板  {cnt_here}只")
+            board_label = f"{boards}板+" if boards == MAX_BAND else f"{boards}板"
+            info_lbl = QLabel(f"{board_label}  {cnt_here}只")
             info_lbl.setStyleSheet(
                 f"color:{MUTED}; font-size:10px; background:transparent;"
             )
@@ -647,13 +649,21 @@ class DayColumn(QWidget):
             for s in duanban:
                 days = s.get("consecutive_days", 1) or 1
                 bg, fg = days_color(days)
+                code = s.get("code", "")
+                name = s.get("name", "")
                 row_w = QWidget()
                 row_w.setFixedHeight(26)
+                row_w.setStyleSheet("QWidget { background: transparent; } QWidget:hover { background: #F3F4F6; }")
+                if on_stock_click:
+                    row_w.setCursor(Qt.CursorShape.PointingHandCursor)
+                    row_w.mousePressEvent = (
+                        lambda e, c=code, n=name: on_stock_click(c, n)
+                    )
                 rl = QHBoxLayout(row_w)
                 rl.setContentsMargins(8, 0, 8, 0)
                 rl.setSpacing(6)
 
-                name_lbl = QLabel(s.get("name", ""))
+                name_lbl = QLabel(name)
                 name_lbl.setStyleSheet(f"color:{MUTED}; font-size:11px;")
 
                 db_pct = s.get("duanban_pct")
@@ -692,6 +702,7 @@ class SectorFilterWidget(QWidget):
         super().__init__(parent)
         self._selected: list[str] = []
         self._all_concepts: list[str] = []
+        self._mode: str = 'and'   # 'and'=交集  'or'=并集
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -710,6 +721,9 @@ class SectorFilterWidget(QWidget):
         self._edit.returnPressed.connect(self._add_current)
 
         layout.addWidget(self._edit)
+
+        # ── 交集 / 并集 toggle（不放在此 layout，由外部 header row 持有）──
+        self._toggle_widget = self._make_toggle_widget()
 
         self._chips_widget = QWidget()
         self._chips_layout = QVBoxLayout(self._chips_widget)
@@ -797,6 +811,60 @@ class SectorFilterWidget(QWidget):
         self._selected.clear()
         self._rebuild_chips()
         self.changed.emit([])
+
+    def _make_toggle_widget(self) -> QWidget:
+        """构建 iOS 风格的分段切换控件（∩ / ∪），由外部放入 header row"""
+        container = QFrame()
+        container.setFixedHeight(22)
+        container.setStyleSheet(
+            "QFrame { background: #E5E7EB; border-radius: 5px; }"
+        )
+        cl = QHBoxLayout(container)
+        cl.setContentsMargins(2, 2, 2, 2)
+        cl.setSpacing(2)
+
+        self._and_btn = QPushButton("∩")
+        self._and_btn.setFixedHeight(18)
+        self._and_btn.setToolTip("交集：个股同时属于所有选中概念")
+        self._and_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._and_btn.clicked.connect(lambda: self._set_mode('and'))
+
+        self._or_btn = QPushButton("∪")
+        self._or_btn.setFixedHeight(18)
+        self._or_btn.setToolTip("并集：个股属于任意一个选中概念")
+        self._or_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._or_btn.clicked.connect(lambda: self._set_mode('or'))
+
+        cl.addWidget(self._and_btn)
+        cl.addWidget(self._or_btn)
+
+        self._refresh_toggle_style()
+        return container
+
+    def _set_mode(self, mode: str):
+        if self._mode == mode:
+            return
+        self._mode = mode
+        self._refresh_toggle_style()
+        if self._selected:
+            self.changed.emit(list(self._selected))
+
+    def _refresh_toggle_style(self):
+        _active = (
+            "QPushButton { background: white; color: #111827; border: none;"
+            " border-radius: 4px; font-size: 12px; font-weight: bold;"
+            " padding: 0px 7px; }"
+        )
+        _inactive = (
+            f"QPushButton {{ background: transparent; color: {MUTED}; border: none;"
+            f" border-radius: 4px; font-size: 12px; padding: 0px 7px; }}"
+            f"QPushButton:hover {{ color: {TEXT}; }}"
+        )
+        self._and_btn.setStyleSheet(_active if self._mode == 'and' else _inactive)
+        self._or_btn.setStyleSheet(_active  if self._mode == 'or'  else _inactive)
+
+    def get_mode(self) -> str:
+        return self._mode
 
     def get_selected(self) -> list[str]:
         return list(self._selected)
@@ -894,11 +962,14 @@ class LadderTab(QWidget):
         self._current_dates: list[str] = []
         self._all_dates: list[str] = []    # 所有有数据的日期
         self._col_widgets: list[DayColumn] = []
-        self._page_offset: int = 0           # 当前显示从第几天开始
+        self._page_offset: int = 0           # 当前显示从第几天（_all_dates 索引）开始
+        self._loaded_count: int = 0          # 当前已渲染的日期数量（随滚动增加）
+        self._loading_more: bool = False     # 防止并发追加
+        self._band_heights: dict[int, int] = {}  # 当前各板的行高，用于追加时比对
         self._concept_heat: dict[str, int] = {}  # 全局概念热度，用于胶囊颜色/排序
         self._stock_code_filter: str | None = None
-        PAGE_SIZE = 10
-        self._page_size = PAGE_SIZE
+        self._PAGE_SIZE = 10
+        self._APPEND_SIZE = 5
 
         self._setup_ui()
 
@@ -907,11 +978,24 @@ class LadderTab(QWidget):
         main_split.setHandleWidth(1)
         main_split.setStyleSheet("QSplitter::handle { background: #E5E5E7; }")
 
-        # ── 左侧筛选面板 ──
+        # ── 左侧筛选面板（可垂直滚动）──
         left = QWidget()
         left.setFixedWidth(220)
         left.setStyleSheet(f"background:{SURFACE};")
-        lv = QVBoxLayout(left)
+        _left_outer = QVBoxLayout(left)
+        _left_outer.setContentsMargins(0, 0, 0, 0)
+        _left_outer.setSpacing(0)
+
+        _left_scroll = QScrollArea()
+        _left_scroll.setWidgetResizable(True)
+        _left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        _left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        _left_scroll.setStyleSheet(
+            f"QScrollArea {{ border:none; background:{SURFACE}; }}"
+        )
+        _left_inner = QWidget()
+        _left_inner.setStyleSheet(f"background:{SURFACE};")
+        lv = QVBoxLayout(_left_inner)
         lv.setContentsMargins(12, 12, 12, 12)
         lv.setSpacing(10)
 
@@ -1077,10 +1161,15 @@ class LadderTab(QWidget):
         lv.addWidget(self._stock_chip)
         self._stock_code_filter: str | None = None
 
-        # 板块筛选
-        lv.addWidget(self._section("概念板块（最多5个）"))
+        # 板块筛选（section 标题与交集/并集 toggle 同行）
         self._sector_filter = SectorFilterWidget()
         self._sector_filter.changed.connect(self._apply_filters)
+        sec_concept_row = QHBoxLayout()
+        sec_concept_row.setContentsMargins(0, 0, 0, 0)
+        sec_concept_row.setSpacing(6)
+        sec_concept_row.addWidget(self._section("概念板块（最多5个）"), 1)
+        sec_concept_row.addWidget(self._sector_filter._toggle_widget)
+        lv.addLayout(sec_concept_row)
         lv.addWidget(self._sector_filter)
 
         # 按钮组
@@ -1096,22 +1185,33 @@ class LadderTab(QWidget):
         lv.addLayout(btn_row)
         lv.addStretch()
 
+        # ── 系统信息 ──
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color:{BORDER};")
+        lv.addWidget(sep)
+
+        self._sys_info_lbl = QLabel()
+        self._sys_info_lbl.setWordWrap(True)
+        self._sys_info_lbl.setStyleSheet(
+            f"color:{MUTED}; font-size:10px; padding:4px 2px 6px 2px;"
+        )
+        self._sys_info_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        lv.addWidget(self._sys_info_lbl)
+        self._refresh_sys_info()
+
+        _left_scroll.setWidget(_left_inner)
+        _left_outer.addWidget(_left_scroll)
+
         # ── 右侧天梯区域 ──
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(0)
 
-        # 日期导航
+        # 日期导航（仅保留日期范围标签，向右滚动到底自动加载更早数据）
         nav = QHBoxLayout()
         nav.setContentsMargins(8, 6, 8, 6)
-        self._prev_btn = QPushButton("◀  更新")
-        self._next_btn = QPushButton("更早  ▶")
-        for btn in (self._prev_btn, self._next_btn):
-            btn.setStyleSheet(self._btn_style(SEL, TEXT))
-            btn.setFixedHeight(28)
-        self._prev_btn.clicked.connect(self._page_next)
-        self._next_btn.clicked.connect(self._page_prev)
         self._date_btn = QPushButton("—")
         self._date_btn.setFlat(True)
         self._date_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1121,11 +1221,9 @@ class LadderTab(QWidget):
             f"QPushButton:hover {{ color:{ACCENT}; text-decoration:underline; }}"
         )
         self._date_btn.clicked.connect(self._show_date_picker)
-        nav.addWidget(self._prev_btn)
         nav.addStretch()
         nav.addWidget(self._date_btn)
         nav.addStretch()
-        nav.addWidget(self._next_btn)
 
         nav_frame = QFrame()
         nav_frame.setStyleSheet(f"background:{SURFACE}; border-bottom:1px solid {BORDER};")
@@ -1153,6 +1251,8 @@ class LadderTab(QWidget):
         self._ladder_hbox.addStretch()
         self._ladder_scroll.setWidget(self._ladder_inner)
         rv.addWidget(self._ladder_scroll, 1)
+        # 滚动到右端时自动追加更早的日期列
+        self._ladder_scroll.horizontalScrollBar().valueChanged.connect(self._on_hscroll)
 
         main_split.addWidget(left)
         main_split.addWidget(right)
@@ -1222,13 +1322,13 @@ class LadderTab(QWidget):
     def load_data(self, all_dates: list[str]):
         self._all_dates = all_dates
         self._page_offset = 0
+        self._loaded_count = self._PAGE_SIZE
         self._refresh_page()
-
 
     def _current_page_dates(self) -> list[str]:
         # all_dates 已按 DESC 排列（最新在前），offset=0 显示最新一页
         start = self._page_offset
-        end = min(len(self._all_dates), start + self._page_size)
+        end = min(len(self._all_dates), start + self._loaded_count)
         return self._all_dates[start:end]  # 保持降序：最新在左
 
     def _get_prev_date(self, date_str: str) -> str | None:
@@ -1245,10 +1345,7 @@ class LadderTab(QWidget):
         dates = self._current_page_dates()
         self._current_dates = dates
         if dates:
-            self._date_btn.setText(
-                f"{dates[0][:4]}-{dates[0][4:6]}-{dates[0][6:]} ~ "
-                f"{dates[-1][:4]}-{dates[-1][4:6]}-{dates[-1][6:]}"
-            )
+            self._date_btn.setText(self._fmt_date_range(dates))
         else:
             self._date_btn.setText("无数据")
 
@@ -1348,6 +1445,7 @@ class LadderTab(QWidget):
         cyq_threshold = self._cyq_threshold
         cyq_filter_active = cyq_threshold is not None
         sectors = self._sector_filter.get_selected()
+        sector_mode = self._sector_filter.get_mode()   # 'and' | 'or'
 
         def _passes(s: dict) -> bool:
             days = s.get("consecutive_days", 1) or 1
@@ -1383,8 +1481,12 @@ class LadderTab(QWidget):
                     return False
             if sectors:
                 sc = set(s.get("all_concepts", []))
-                if not sc.issuperset(sectors):
-                    return False
+                if sector_mode == 'and':
+                    if not sc.issuperset(sectors):   # 交集：必须含全部选中概念
+                        return False
+                else:
+                    if not sc.intersection(sectors): # 并集：含任意一个即可
+                        return False
             return True
 
         # 先计算每日筛选结果
@@ -1397,7 +1499,7 @@ class LadderTab(QWidget):
         for stocks in filtered_by_date.values():
             by_board: dict[int, int] = {}
             for s in stocks:
-                b = max(1, s.get("consecutive_days") or 1)
+                b = min(MAX_BAND, max(1, s.get("consecutive_days") or 1))
                 by_board[b] = by_board.get(b, 0) + 1
             for b, cnt in by_board.items():
                 band_max[b] = max(band_max.get(b, 0), cnt)
@@ -1407,6 +1509,7 @@ class LadderTab(QWidget):
             for b, cnt in band_max.items()
             if cnt > 0
         }
+        self._band_heights = band_heights
 
         # 计算各日期各板数的晋级率
         # self._current_dates 降序（最新在前），dates[i+1] 是 dates[i] 的前一交易日
@@ -1414,7 +1517,7 @@ class LadderTab(QWidget):
         for date in self._current_dates:
             bbc: dict[int, int] = {}
             for s in filtered_by_date.get(date, []):
-                b = max(1, s.get("consecutive_days") or 1)
+                b = min(MAX_BAND, max(1, s.get("consecutive_days") or 1))
                 bbc[b] = bbc.get(b, 0) + 1
             by_board_count[date] = bbc
 
@@ -1450,7 +1553,12 @@ class LadderTab(QWidget):
 
         # 重建列
         self._clear_columns()
-        for date in self._current_dates:
+        for i, date in enumerate(self._current_dates):
+            # 周分隔线：当前日期与前一列（更新的日期）跨周时插入
+            if i > 0 and self._is_week_boundary(self._current_dates[i - 1], date):
+                sep = self._make_week_sep()
+                self._ladder_hbox.insertWidget(self._ladder_hbox.count() - 1, sep)
+                self._col_widgets.append(sep)
             col = DayColumn(
                 date, filtered_by_date[date], band_heights,
                 promotion_rates=promotion_rates_by_date.get(date),
@@ -1469,13 +1577,55 @@ class LadderTab(QWidget):
             w.deleteLater()
         self._col_widgets.clear()
 
+    @staticmethod
+    def _is_week_boundary(newer: str, older: str) -> bool:
+        """判断相邻两个交易日是否跨越自然周（ISO week）"""
+        from datetime import date as _date
+        d1 = _date(int(newer[:4]), int(newer[4:6]), int(newer[6:]))
+        d2 = _date(int(older[:4]), int(older[4:6]), int(older[6:]))
+        return d1.isocalendar()[1] != d2.isocalendar()[1]
+
+    @staticmethod
+    def _make_week_sep() -> QFrame:
+        """生成周分隔竖线"""
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("QFrame { color: #D1D5DB; }")
+        return sep
+
     def _show_date_picker(self):
         dlg = _DatePickerDialog(self._all_dates, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             chosen = dlg.selected_date()  # "YYYYMMDD"
             if chosen and chosen in self._all_dates:
                 self._page_offset = self._all_dates.index(chosen)
+                self._loaded_count = self._PAGE_SIZE
                 self._refresh_page()
+
+    def _refresh_sys_info(self):
+        """读取 DB 元信息并更新侧边栏系统信息标签"""
+        import os
+        from pathlib import Path
+        try:
+            db_path = Path.home() / ".limit_ladder.db"
+            size_mb = os.path.getsize(db_path) / 1024 / 1024
+            with store.get_conn() as c:
+                zt_cnt   = c.execute("SELECT COUNT(*) FROM zt_records").fetchone()[0]
+                cyq_cnt  = c.execute("SELECT COUNT(*) FROM cyq_records").fetchone()[0]
+                sc_cnt   = c.execute("SELECT COUNT(*) FROM stock_concepts").fetchone()[0]
+                db_cnt   = c.execute("SELECT COUNT(*) FROM duanban_records").fetchone()[0]
+                date_cnt = c.execute("SELECT COUNT(DISTINCT date) FROM zt_records").fetchone()[0]
+            text = (
+                f"数据库  {size_mb:.1f} MB\n"
+                f"涨停记录  {zt_cnt:,} 条  /{date_cnt} 日\n"
+                f"筹码集中度  {cyq_cnt:,} 条\n"
+                f"概念映射  {sc_cnt:,} 条\n"
+                f"断板记录  {db_cnt:,} 条"
+            )
+        except Exception:
+            text = "系统信息读取失败"
+        self._sys_info_lbl.setText(text)
 
     def _reset_filters(self):
         self._clear_stock_filter()
@@ -1492,18 +1642,123 @@ class LadderTab(QWidget):
         self._max_pe.setValue(9999)
         self._sector_filter.clear_all()
 
-    def _page_prev(self):
-        """向更早的日期翻页"""
-        new_offset = self._page_offset + self._page_size
-        if new_offset < len(self._all_dates):
-            self._page_offset = new_offset
-            self._refresh_page()
+    def _fmt_date_range(self, dates: list[str]) -> str:
+        if not dates:
+            return "无数据"
+        newest, oldest = dates[0], dates[-1]
+        return (f"{newest[:4]}-{newest[4:6]}-{newest[6:]}  ~  "
+                f"{oldest[:4]}-{oldest[4:6]}-{oldest[6:]}")
 
-    def _page_next(self):
-        """向更新的日期翻页"""
-        new_offset = max(0, self._page_offset - self._page_size)
-        self._page_offset = new_offset
-        self._refresh_page()
+    def _on_hscroll(self, value: int):
+        """横向滚动条接近右端时，自动追加更早的日期列"""
+        bar = self._ladder_scroll.horizontalScrollBar()
+        if bar.maximum() > 0 and value >= bar.maximum() - 300 and not self._loading_more:
+            self._append_more()
+
+    def _append_more(self):
+        """追加下一批更早的日期列（不清空已有列，直接在末尾插入）"""
+        end = self._page_offset + self._loaded_count
+        if end >= len(self._all_dates):
+            return
+        self._loading_more = True
+
+        new_dates = self._all_dates[end: end + self._APPEND_SIZE]
+
+        # 拉取新日期的数据
+        extra_prev = []
+        for d in new_dates:
+            pd = self._get_prev_date(d)
+            if pd and pd not in self._full_data and pd not in new_dates:
+                extra_prev.append(pd)
+        fetch_dates = new_dates + extra_prev
+        new_raw = store.get_zt_for_dates(fetch_dates)
+        new_duanban = store.get_duanban_pct_for_dates(fetch_dates)
+        new_cyq = store.get_cyq_for_dates(fetch_dates)
+
+        # 附加概念
+        new_codes = {s["code"] for stocks in new_raw.values() for s in stocks}
+        _src = None if self._concept_source == 'all' else self._concept_source
+        new_concepts = store.get_stock_concepts(list(new_codes), source=_src)
+        for date, stocks in new_raw.items():
+            date_cyq = new_cyq.get(date, {})
+            for s in stocks:
+                code = s["code"]
+                concepts = new_concepts.get(code, [])
+                s["all_concepts"] = concepts
+                s["primary_concept"] = (
+                    max(concepts, key=lambda c: self._concept_heat.get(c, 0))
+                    if concepts else "N/A"
+                )
+                cyq_val = date_cyq.get(code)
+                if cyq_val is not None:
+                    s["concentration_90"] = cyq_val
+
+        # 合并进全量缓存
+        self._full_data.update(new_raw)
+        self._duanban_pct_map.update(new_duanban)
+        self._cyq_map = {**getattr(self, "_cyq_map", {}), **new_cyq}
+        for d in new_dates:
+            self._prev_date_map[d] = self._get_prev_date(d)
+
+        self._loaded_count += len(new_dates)
+        self._current_dates = self._all_dates[
+            self._page_offset: self._page_offset + self._loaded_count
+        ]
+
+        # 检查追加后 band_heights 是否需要扩展
+        new_band_max: dict[int, int] = dict(self._band_heights)
+        for d in new_dates:
+            by_board: dict[int, int] = {}
+            for s in new_raw.get(d, []):
+                b = min(MAX_BAND, max(1, s.get("consecutive_days") or 1))
+                by_board[b] = by_board.get(b, 0) + 1
+            for b, cnt in by_board.items():
+                new_band_max[b] = max(new_band_max.get(b, 0), cnt)
+        new_band_heights = {
+            b: cnt * (CARD_H + CARD_SPACING) + BAND_PAD
+            for b, cnt in new_band_max.items() if cnt > 0
+        }
+
+        if new_band_heights != self._band_heights:
+            # band 高度有变化，整体重绘
+            self._apply_filters()
+        else:
+            # band 高度不变，只追加新列
+            cyq_map = getattr(self, "_cyq_map", {})
+            duanban_pct_map = getattr(self, "_duanban_pct_map", {})
+            # 已渲染的最后一列日期（用于判断首条是否需要分隔线）
+            last_rendered = self._current_dates[-(len(new_dates) + 1)] if len(self._current_dates) > len(new_dates) else None
+            for i, date in enumerate(new_dates):
+                # 判断与前一列（已渲染最后一列或本批上一列）是否跨周
+                prev_col_date = new_dates[i - 1] if i > 0 else last_rendered
+                if prev_col_date and self._is_week_boundary(prev_col_date, date):
+                    sep = self._make_week_sep()
+                    self._ladder_hbox.insertWidget(self._ladder_hbox.count() - 1, sep)
+                    self._col_widgets.append(sep)
+                prev_d = self._prev_date_map.get(date)
+                today_codes = {s["code"] for s in self._full_data.get(date, [])}
+                duanban = []
+                if prev_d and prev_d in self._full_data:
+                    pct_for_date = duanban_pct_map.get(date, {})
+                    duanban = [
+                        {**s, "duanban_pct": pct_for_date.get(s["code"])}
+                        for s in self._full_data[prev_d]
+                        if s["code"] not in today_codes
+                    ]
+                col = DayColumn(
+                    date, new_raw.get(date, []), new_band_heights,
+                    promotion_rates={},
+                    concept_heat=self._concept_heat,
+                    on_concept_click=self._sector_filter.add_concept,
+                    on_days_click=self._on_days_filter_click,
+                    on_stock_click=self._on_stock_filter_click,
+                    duanban=duanban,
+                )
+                self._ladder_hbox.insertWidget(self._ladder_hbox.count() - 1, col)
+                self._col_widgets.append(col)
+            self._date_btn.setText(self._fmt_date_range(self._current_dates))
+
+        self._loading_more = False
 
     def _on_stock_filter_click(self, code: str, name: str):
         """点击个股卡片：已选则取消，未选则设为筛选条件"""
@@ -1513,7 +1768,83 @@ class LadderTab(QWidget):
         self._stock_code_filter = code
         self._stock_chip_lbl.setText(f"{name}  {code}")
         self._stock_chip.show()
+        self._ensure_duanban_in_window(code)
         self._apply_filters()
+
+    def _ensure_duanban_in_window(self, code: str):
+        """若该股断板日期（ZT日次交易日）在 _all_dates 中但超出已加载窗口，则扩展窗口。
+        主要针对通过日期选择器跳转到历史段、断板日落在窗口左侧（更新方向）的场景。"""
+        if not self._all_dates:
+            return
+        zt_dates = store.get_zt_dates_for_code(code)
+        if not zt_dates:
+            return
+        zt_set = set(zt_dates)
+        all_idx = {d: i for i, d in enumerate(self._all_dates)}
+
+        # 找出断板日期（ZT日在 _all_dates 中的次日，且本身不在ZT池）
+        # 若该日期的 index < page_offset，说明它在当前窗口之外（更新方向）
+        min_new_idx = self._page_offset
+        for zt_date in zt_dates:
+            idx = all_idx.get(zt_date)
+            if idx is None or idx == 0:
+                continue
+            next_date = self._all_dates[idx - 1]   # 下一交易日（更新）
+            if next_date not in zt_set:             # 非ZT → 断板日
+                duanban_idx = idx - 1
+                if duanban_idx < self._page_offset:
+                    min_new_idx = min(min_new_idx, duanban_idx)
+
+        if min_new_idx >= self._page_offset:
+            return  # 窗口已覆盖所有断板日
+
+        new_dates = self._all_dates[min_new_idx : self._page_offset]
+
+        # 计算额外需要的 prev 日期（用于断板行计算）
+        extra_prev = []
+        for d in new_dates:
+            pd = self._get_prev_date(d)
+            if pd and pd not in self._full_data and pd not in new_dates:
+                extra_prev.append(pd)
+
+        fetch = [d for d in (list(new_dates) + extra_prev) if d not in self._full_data]
+        if fetch:
+            new_raw = store.get_zt_for_dates(fetch)
+            new_duanban = store.get_duanban_pct_for_dates(fetch)
+            new_cyq = store.get_cyq_for_dates(fetch)
+
+            new_codes = {s["code"] for ss in new_raw.values() for s in ss}
+            _src = None if self._concept_source == 'all' else self._concept_source
+            new_concepts = store.get_stock_concepts(list(new_codes), source=_src)
+            for date, stocks in new_raw.items():
+                date_cyq = new_cyq.get(date, {})
+                for s in stocks:
+                    c = s["code"]
+                    concepts = new_concepts.get(c, [])
+                    s["all_concepts"] = concepts
+                    s["primary_concept"] = (
+                        max(concepts, key=lambda cc: self._concept_heat.get(cc, 0))
+                        if concepts else "N/A"
+                    )
+                    cyq_val = date_cyq.get(c)
+                    if cyq_val is not None:
+                        s["concentration_90"] = cyq_val
+
+            self._full_data.update(new_raw)
+            self._duanban_pct_map.update(new_duanban)
+            self._cyq_map = {**getattr(self, "_cyq_map", {}), **new_cyq}
+
+        for d in new_dates:
+            if d not in self._prev_date_map:
+                self._prev_date_map[d] = self._get_prev_date(d)
+
+        # 扩展窗口（向更新方向：减小 page_offset，增加 loaded_count）
+        n_added = self._page_offset - min_new_idx
+        self._page_offset = min_new_idx
+        self._loaded_count += n_added
+        self._current_dates = self._all_dates[
+            self._page_offset : self._page_offset + self._loaded_count
+        ]
 
     def _clear_stock_filter(self):
         self._stock_code_filter = None
@@ -2084,7 +2415,7 @@ class MainWindow(QMainWindow):
 
         # 把网络操作全部交给后台线程（dates=None 表示线程自行获取交易日历）
         self._fetch_worker = FetchWorker(
-            dates=None, months=1, force_dates=dates_need_refetch
+            dates=None, months=9, force_dates=dates_need_refetch
         )
         self._fetch_worker.progress.connect(self._set_status)
         self._fetch_worker.done.connect(self._after_fetch)
@@ -2108,13 +2439,23 @@ class MainWindow(QMainWindow):
             self._start_sector_stats(all_dates[:30])
 
         self._set_status(f"已加载 {len(all_dates)} 个交易日数据")
+        self._ladder_tab._refresh_sys_info()
+
+        # 若有历史空白日期（status='empty'）尚未重建，启动历史重建
+        with store.get_conn() as c:
+            empty_count = c.execute(
+                "SELECT COUNT(*) FROM fetch_log WHERE status='empty' AND key LIKE 'zt_%'"
+            ).fetchone()[0]
+        if empty_count > 0 and not store.is_fetched("historical_zt_built", max_age_hours=168):
+            self._start_historical_fetch()
+            return  # 历史重建完成后会再触发 _after_historical → concept fetch
 
         # 若 THS 概念映射未建立（首次或一周后过期），后台启动抓取
         if not store.is_fetched("ths_concepts_built", max_age_hours=168):
             self._start_concept_fetch()
 
     def _start_historical_fetch(self):
-        self._set_status("开始后台重建 6 个月历史涨停数据（约需 5 分钟）...")
+        self._set_status("开始后台重建历史涨停数据（约需 2 分钟）...")
         self._historical_worker = HistoricalFetchWorker()
         self._historical_worker.progress.connect(self._set_status)
         self._historical_worker.done.connect(self._after_historical)
@@ -2186,7 +2527,7 @@ class MainWindow(QMainWindow):
                 for d in dates_need_refetch:
                     c.execute("DELETE FROM fetch_log WHERE key=?", (f"zt_{d}",))
         self._fetch_worker = FetchWorker(
-            dates=None, months=1, force_dates=dates_need_refetch
+            dates=None, months=9, force_dates=dates_need_refetch
         )
         self._fetch_worker.progress.connect(self._set_status)
         self._fetch_worker.done.connect(self._after_fetch)
