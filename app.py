@@ -140,7 +140,7 @@ class FetchWorker(QThread):
 
             # 补填历史日期缺失的 PE（按日期价格比例换算，各日期独立截面）
             if not self._stop:
-                dates_missing_pe = store.get_dates_missing_pe(days=14)
+                dates_missing_pe = store.get_dates_missing_pe(days=90)
                 for i, d in enumerate(dates_missing_pe):
                     if self._stop:
                         break
@@ -181,10 +181,10 @@ class FetchWorker(QThread):
                         curr_d, code_prev_price, stop_flag=lambda: self._stop
                     )
 
-            # 补填筹码集中度（全量历史个股，需外网）
+            # 补填筹码集中度（全量历史个股，本地近似算法）
             if not self._stop:
                 all_codes_cyq = store.get_all_zt_codes()
-                self.progress.emit(f"筹码集中度 共{len(all_codes_cyq)}只（需外网）")
+                self.progress.emit(f"筹码集中度 共{len(all_codes_cyq)}只")
                 fetcher.fetch_and_store_cyq(all_codes_cyq, stop_flag=lambda: self._stop)
 
             # 完成后从 DB 取完整日期列表
