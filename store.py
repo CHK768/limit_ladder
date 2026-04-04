@@ -68,6 +68,20 @@ def init_db():
             status     TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS duanban_records (
+            date       TEXT NOT NULL,
+            code       TEXT NOT NULL,
+            pct_change REAL,
+            PRIMARY KEY (date, code)
+        );
+
+        CREATE TABLE IF NOT EXISTS cyq_records (
+            date              TEXT NOT NULL,
+            code              TEXT NOT NULL,
+            concentration_90  REAL,
+            PRIMARY KEY (date, code)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_zt_date ON zt_records(date);
         """)
         # 兼容旧版数据库：pe 列可能不存在
@@ -75,6 +89,11 @@ def init_db():
             c.execute("ALTER TABLE zt_records ADD COLUMN pe REAL")
         except Exception:
             pass  # 列已存在，忽略
+        # 兼容旧版数据库：pct_change 列可能不存在
+        try:
+            c.execute("ALTER TABLE zt_records ADD COLUMN pct_change REAL")
+        except Exception:
+            pass
         # 兼容旧版数据库：source 列可能不存在
         try:
             c.execute("ALTER TABLE stock_concepts ADD COLUMN source TEXT DEFAULT 'em'")
@@ -122,11 +141,11 @@ def upsert_zt_records(rows: list[dict]):
         c.executemany(
             """INSERT OR REPLACE INTO zt_records
                (date, code, name, price, consecutive_days, float_cap, total_cap,
-                first_limit_time, last_limit_time, seal_amount, pe)
+                first_limit_time, last_limit_time, seal_amount, pe, pct_change)
                VALUES
                (:date,:code,:name,:price,:consecutive_days,:float_cap,:total_cap,
-                :first_limit_time,:last_limit_time,:seal_amount,:pe)""",
-            [{**r, "pe": r.get("pe")} for r in rows],
+                :first_limit_time,:last_limit_time,:seal_amount,:pe,:pct_change)""",
+            [{**r, "pe": r.get("pe"), "pct_change": r.get("pct_change")} for r in rows],
         )
 
 
@@ -199,7 +218,7 @@ def get_zt_for_dates(dates: list[str]) -> dict[str, list[dict]]:
     with get_conn() as c:
         rows = c.execute(
             f"""SELECT date, code, name, price, consecutive_days,
-                       float_cap, total_cap, first_limit_time, seal_amount, pe
+                       float_cap, total_cap, first_limit_time, seal_amount, pe, pct_change
                 FROM zt_records
                 WHERE date IN ({ph})
                 ORDER BY date DESC, consecutive_days DESC""",
@@ -426,12 +445,72 @@ def get_dates_missing_pe(days: int = 14) -> list[str]:
     return [r[0] for r in rows]
 
 
+def upsert_duanban_records(rows: list[dict]):
+    if not rows:
+        return
+    with get_conn() as c:
+        c.executemany(
+            "INSERT OR REPLACE INTO duanban_records (date, code, pct_change) VALUES (:date,:code,:pct_change)",
+            rows,
+        )
+
+
+def get_duanban_pct_for_dates(dates: list[str]) -> dict[str, dict[str, float]]:
+    """返回 {date: {code: pct_change}}"""
+    if not dates:
+        return {}
+    ph = ",".join("?" * len(dates))
+    with get_conn() as c:
+        rows = c.execute(
+            f"SELECT date, code, pct_change FROM duanban_records WHERE date IN ({ph})",
+            dates,
+        ).fetchall()
+    result: dict[str, dict[str, float]] = {}
+    for r in rows:
+        result.setdefault(r["date"], {})[r["code"]] = r["pct_change"]
+    return result
+
+
 def get_codes_for_date(date: str) -> list[str]:
     """返回某日涨停记录的代码列表"""
     with get_conn() as c:
         rows = c.execute(
             "SELECT code FROM zt_records WHERE date=?", (date,)
         ).fetchall()
+    return [r[0] for r in rows]
+
+
+def upsert_cyq_records(rows: list[dict]):
+    if not rows:
+        return
+    with get_conn() as c:
+        c.executemany(
+            "INSERT OR REPLACE INTO cyq_records (date, code, concentration_90) VALUES (:date,:code,:concentration_90)",
+            rows,
+        )
+
+
+def get_cyq_for_dates(dates: list[str]) -> dict[str, dict[str, float]]:
+    """返回 {date: {code: concentration_90}}"""
+    if not dates:
+        return {}
+    ph = ",".join("?" * len(dates))
+    with get_conn() as c:
+        rows = c.execute(
+            f"SELECT date, code, concentration_90 FROM cyq_records WHERE date IN ({ph})",
+            dates,
+        ).fetchall()
+    result: dict[str, dict[str, float]] = {}
+    for r in rows:
+        if r["concentration_90"] is not None:
+            result.setdefault(r["date"], {})[r["code"]] = r["concentration_90"]
+    return result
+
+
+def get_all_zt_codes() -> list[str]:
+    """返回 zt_records 中所有不重复的股票代码"""
+    with get_conn() as c:
+        rows = c.execute("SELECT DISTINCT code FROM zt_records").fetchall()
     return [r[0] for r in rows]
 
 
