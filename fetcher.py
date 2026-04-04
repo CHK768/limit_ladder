@@ -831,14 +831,14 @@ def fetch_and_store_duanban_pct(
     """
     key = f"duanban_pct_{date_str}"
     if is_fetched(key, max_age_hours=max_age_hours):
-        # 若缓存标记存在但 DB 中无数据，则视为脏缓存，重新拉取
+        # 缓存有效，但若记录数少于预期股票数则视为部分拉取，继续补全
         with get_conn() as c:
             cnt = c.execute(
                 "SELECT COUNT(*) FROM duanban_records WHERE date=?", (date_str,)
             ).fetchone()[0]
-        if cnt > 0 or not code_prev_price:
+        if cnt >= len(code_prev_price) or not code_prev_price:
             return -1
-        # 否则落穿，继续拉取
+        # 记录不全（部分拉取），落穿继续补全
 
     if not code_prev_price:
         mark_fetched(key)
