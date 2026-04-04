@@ -38,6 +38,7 @@ from store import (
     is_fetched, mark_fetched,
     upsert_zt_records, upsert_dt_records, upsert_zt_pe,
     upsert_stock_concepts, upsert_sector_stats,
+    upsert_duanban_records, upsert_cyq_records,
     get_conn,
 )
 
@@ -159,6 +160,7 @@ def fetch_and_store_zt(date_str: str, force: bool = False, max_age_hours: float 
                 "code": code,
                 "name": str(r.get("名称", "")),
                 "price": _safe_float(r.get("最新价")),
+                "pct_change": _safe_float(r.get("涨跌幅")),
                 "consecutive_days": int(r.get("连板数", 1) or 1),
                 "float_cap": _normalize_cap(r.get("流通市值")),
                 "total_cap": _normalize_cap(r.get("总市值")),
@@ -668,11 +670,13 @@ def _calc_zt_for_stock(
                     if date_str in needed_dates:
                         # 用当日流通股 × 收盘价算当日流通市值
                         day_cap = round(shares * close / 1e8, 2) if shares > 0 else float_cap
+                        pct = round((close - prev_close) / prev_close * 100, 2) if prev_close > 0 else None
                         records.append({
                             "date": date_str,
                             "code": code,
                             "name": name,
                             "price": close,
+                            "pct_change": pct,
                             "consecutive_days": consecutive,
                             "float_cap": day_cap,
                             "total_cap": total_cap,
@@ -799,3 +803,115 @@ def fetch_historical_zt_all(progress_cb=None, stop_flag=None) -> int:
     if progress_cb:
         progress_cb(f"历史数据重建完成，覆盖 {len(needed_dates)} 个交易日")
     return len(needed_dates)
+
+
+# ─────────────────────────── 断板涨跌幅 ───────────────────────────
+
+def fetch_and_store_duanban_pct(
+    date_str: str,
+    code_prev_price: dict[str, float],
+    max_age_hours: float = 24,
+    stop_flag=None,
+) -> int:
+    """
+    获取并存储指定日期各断板股票的当日实际涨跌幅。
+    code_prev_price: {code: 前一交易日收盘价（即ZT价格）}
+    使用 stock_zh_a_daily 拉取当日收盘价，计算 pct_change。
+    返回成功写入的记录数；仅在有数据写入时才缓存成功标记。
+    """
+    key = f"duanban_pct_{date_str}"
+    if is_fetched(key, max_age_hours=max_age_hours):
+        # 若缓存标记存在但 DB 中无数据，则视为脏缓存，重新拉取
+        with get_conn() as c:
+            cnt = c.execute(
+                "SELECT COUNT(*) FROM duanban_records WHERE date=?", (date_str,)
+            ).fetchone()[0]
+        if cnt > 0 or not code_prev_price:
+            return -1
+        # 否则落穿，继续拉取
+
+    if not code_prev_price:
+        mark_fetched(key)
+        return 0
+
+    rows: list[dict] = []
+
+    for code, prev_close in code_prev_price.items():
+        if stop_flag and stop_flag():
+            break
+        if not prev_close or prev_close <= 0:
+            continue
+        try:
+            prefix = _market_prefix(code)
+            df = _call_with_timeout(
+                lambda: ak.stock_zh_a_daily(
+                    symbol=f"{prefix}{code}",
+                    start_date=date_str,
+                    end_date=date_str,
+                    adjust="",
+                ),
+                timeout=12,
+            )
+            if df is not None and not df.empty:
+                today_close = _safe_float(df.iloc[-1]["close"])
+                if today_close and today_close > 0:
+                    pct = round((today_close - prev_close) / prev_close * 100, 2)
+                    rows.append({"date": date_str, "code": code, "pct_change": pct})
+        except Exception as e:
+            print(f"fetch_duanban_pct {code} {date_str}: {e}")
+        time.sleep(0.05)
+
+    if rows:
+        upsert_duanban_records(rows)
+        mark_fetched(key)
+    return len(rows)
+
+
+# ─────────────────────────── 筹码集中度 ───────────────────────────
+
+def fetch_and_store_cyq(
+    codes: list[str],
+    max_age_hours: float = 48,
+    stop_flag=None,
+) -> int:
+    """
+    直接调用 ak.stock_cyq_em 获取 90% 筹码集中度（需外网访问 EastMoney API）。
+    每只股票以 cyq_code_{code} 为缓存键，max_age_hours 内不重复拉取。
+    stock_cyq_em 返回最近 90 个交易日的集中度，全部存入 cyq_records。
+    返回成功写入的总记录数。
+    注意：stock_cyq_em 使用 py_mini_racer 执行 JS，必须串行调用，不可多线程。
+    """
+    total = 0
+    for code in codes:
+        if stop_flag and stop_flag():
+            break
+        key = f"cyq_code_{code}"
+        if is_fetched(key, max_age_hours=max_age_hours):
+            continue
+        try:
+            df = _call_with_timeout(
+                lambda: ak.stock_cyq_em(symbol=code, adjust=""),
+                timeout=30,
+            )
+            if df is None or df.empty or "90集中度" not in df.columns:
+                continue
+            rows = []
+            for _, row in df.iterrows():
+                date_val = row.get("日期")
+                cyq_val = row.get("90集中度")
+                if date_val is None or cyq_val is None or pd.isna(cyq_val):
+                    continue
+                # 日期转 YYYYMMDD 字符串
+                if hasattr(date_val, "strftime"):
+                    date_str = date_val.strftime("%Y%m%d")
+                else:
+                    date_str = str(date_val).replace("-", "")[:8]
+                rows.append({"date": date_str, "code": code, "concentration_90": float(cyq_val)})
+            if rows:
+                upsert_cyq_records(rows)
+                mark_fetched(key)
+                total += len(rows)
+        except Exception as e:
+            print(f"fetch_cyq {code}: {e}")
+        time.sleep(0.1)   # py_mini_racer 需要喘息间隔
+    return total
