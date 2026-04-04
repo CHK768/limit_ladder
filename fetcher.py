@@ -882,112 +882,86 @@ def fetch_and_store_duanban_pct(
 
 # ─────────────────────────── 筹码集中度 ───────────────────────────
 
-def _compute_cyq_concentration(df: pd.DataFrame) -> float | None:
+def _compute_cyq_concentration(
+    df: pd.DataFrame, pct: float = 0.9, factor: int = 150, window: int = 120
+) -> float | None:
     """
-    用均匀分布模型近似计算90%筹码集中度（小数形式，如0.08表示8%）。
-    df 须含 close / high / low / volume 列，按日期升序排列。
-    算法：
-      1. 将价格区间[min_low, max_high]分成 N_BUCKETS 个桶
-      2. 每日成交量按[low,high]均匀分配到对应桶
-      3. 从当日收盘价向外扩展，找覆盖90%筹码的最小区间
-      4. 返回 (区间宽度) / (区间中心价) 作为集中度
+    复现东方财富 CYQCalculator 算法，计算 90% 筹码集中度。
+    df 需含列: open, high, low, close, turnover（换手率小数形式，如 0.02 = 2%）
+    返回 (pr1-pr0)/(pr1+pr0)，越小越集中；失败返回 None。
     """
-    required = {"close", "high", "low", "volume"}
-    if df is None or df.empty or len(df) < 10:
+    if df is None or len(df) == 0:
         return None
-    if not required.issubset(set(df.columns)):
-        return None
-
-    price_min = float(df["low"].min())
-    price_max = float(df["high"].max())
-    if price_min <= 0 or price_max <= price_min:
+    required = {"open", "high", "low", "close", "turnover"}
+    if not required.issubset(df.columns):
         return None
 
-    N = 500
-    price_range = price_max - price_min
-    buckets = [0.0] * N
+    kdata = df.tail(window).reset_index(drop=True)
+    maxprice = float(kdata["high"].max())
+    minprice = float(kdata["low"].min())
+    if maxprice <= minprice:
+        return None
 
-    for _, row in df.iterrows():
+    accuracy = max(0.01, (maxprice - minprice) / (factor - 1))
+    xdata = [0.0] * factor
+
+    for _, row in kdata.iterrows():
+        o = float(row["open"])
+        c = float(row["close"])
+        h = float(row["high"])
         lo = float(row["low"])
-        hi = float(row["high"])
-        vol = float(row["volume"])
-        if vol <= 0:
-            continue
-        if hi <= lo:
-            idx = min(N - 1, int((float(row["close"]) - price_min) / price_range * N))
-            buckets[max(0, idx)] += vol
-            continue
-        vol_per_price = vol / (hi - lo)
-        i_lo = max(0, int((lo - price_min) / price_range * N))
-        i_hi = min(N - 1, int((hi - price_min) / price_range * N))
-        for i in range(i_lo, i_hi + 1):
-            b_lo = price_min + i * price_range / N
-            b_hi = price_min + (i + 1) * price_range / N
-            overlap = min(hi, b_hi) - max(lo, b_lo)
-            if overlap > 0:
-                buckets[i] += vol_per_price * overlap
+        avg = (o + c + h + lo) / 4.0
+        tr = float(row["turnover"]) if not pd.isna(row["turnover"]) else 0.0
+        turnover_rate = min(1.0, tr)
 
-    total_chips = sum(buckets)
+        H = int((h - minprice) / accuracy)
+        L = math.ceil((lo - minprice) / accuracy)
+        G_x = float(factor - 1) if h == lo else 2.0 / (h - lo)
+        G_y = int((avg - minprice) / accuracy)
+
+        decay = 1.0 - turnover_rate
+        for n in range(factor):
+            xdata[n] *= decay
+
+        if h == lo:
+            if 0 <= G_y < factor:
+                xdata[G_y] += G_x * turnover_rate / 2.0
+        else:
+            for j in range(max(0, L), min(H + 1, factor)):
+                curprice = minprice + accuracy * j
+                if curprice <= avg:
+                    denom = avg - lo
+                    if abs(denom) < 1e-8:
+                        xdata[j] += G_x * turnover_rate
+                    else:
+                        xdata[j] += (curprice - lo) / denom * G_x * turnover_rate
+                else:
+                    denom = h - avg
+                    if abs(denom) < 1e-8:
+                        xdata[j] += G_x * turnover_rate
+                    else:
+                        xdata[j] += (h - curprice) / denom * G_x * turnover_rate
+
+    total_chips = sum(xdata)
     if total_chips <= 0:
         return None
 
-    current_price = float(df["close"].iloc[-1])
-    center_idx = max(0, min(N - 1, int((current_price - price_min) / price_range * N)))
+    ps0 = (1 - pct) / 2
+    ps1 = (1 + pct) / 2
 
-    target = 0.90 * total_chips
-    lo_ptr = center_idx
-    hi_ptr = center_idx
-    covered = buckets[center_idx]
+    def get_cost_by_chip(target: float) -> float:
+        s = 0.0
+        for i, x in enumerate(xdata):
+            if s + x > target:
+                return minprice + i * accuracy
+            s += x
+        return maxprice
 
-    while covered < target:
-        lo_can = buckets[lo_ptr - 1] if lo_ptr > 0 else -1.0
-        hi_can = buckets[hi_ptr + 1] if hi_ptr < N - 1 else -1.0
-        if lo_can < 0 and hi_can < 0:
-            break
-        if hi_can >= lo_can:
-            hi_ptr += 1
-            covered += buckets[hi_ptr]
-        else:
-            lo_ptr -= 1
-            covered += buckets[lo_ptr]
-
-    band = (hi_ptr - lo_ptr + 1) * price_range / N
-    center_price = price_min + (lo_ptr + hi_ptr) / 2 * price_range / N
-    if center_price <= 0:
-        center_price = current_price
-    return band / center_price
-
-
-def _fetch_tencent_kline(code: str, n_days: int = 250) -> "pd.DataFrame | None":
-    """
-    直接调腾讯日 K JSON 接口获取 OHLCV，绕过 AKShare 内部的日期解析 bug。
-    返回含 open/close/high/low/volume 列的 DataFrame（按时间升序），失败返回 None。
-    """
-    sym = f"{_market_prefix(code)}{code}"
-    url = (
-        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-        f"?param={sym},day,,,{n_days},"
-    )
-    import requests as _r
-    resp = _r.get(url, timeout=10, verify=False)
-    raw = resp.json()
-    records = raw.get("data", {}).get(sym, {}).get("day", [])
-    if not records:
-        return None
-    rows = []
-    for r in records:
-        # 每条: [date_str, open, close, high, low, volume, ...]
-        try:
-            rows.append({
-                "open":   float(r[1]),
-                "close":  float(r[2]),
-                "high":   float(r[3]),
-                "low":    float(r[4]),
-                "volume": float(r[5]),
-            })
-        except (IndexError, ValueError):
-            continue
-    return pd.DataFrame(rows) if rows else None
+    pr0 = get_cost_by_chip(total_chips * ps0)
+    pr1 = get_cost_by_chip(total_chips * ps1)
+    if (pr0 + pr1) == 0:
+        return 0.0
+    return round((pr1 - pr0) / (pr0 + pr1), 4)
 
 
 def fetch_and_store_cyq(
@@ -996,9 +970,9 @@ def fetch_and_store_cyq(
     stop_flag=None,
 ) -> int:
     """
-    用腾讯日 K JSON 接口 + 本地均匀分布模型近似计算90%筹码集中度。
-    对每只股票取最近250个交易日的OHLCV，计算一次集中度，
-    写入该股在 zt_records 中出现的所有日期，确保历史卡片也能显示。
+    用 stock_zh_a_daily（新浪/腾讯）获取 OHLCV + 换手率，
+    再用 CYQCalculator 算法近似计算90%筹码集中度。
+    写入该股在 zt_records 中出现的所有日期，确保历史卡片能显示。
     """
     from store import get_conn
     total = 0
@@ -1009,24 +983,24 @@ def fetch_and_store_cyq(
         if is_fetched(key, max_age_hours=max_age_hours):
             continue
         try:
+            sym = f"{_market_prefix(code)}{code}"
             df = _call_with_timeout(
-                lambda c=code: _fetch_tencent_kline(c),
+                lambda s=sym: ak.stock_zh_a_daily(symbol=s, adjust=""),
                 timeout=30,
             )
-            if df is None or df.empty:
+            if df is None or df.empty or "turnover" not in df.columns:
                 continue
-            df = df.tail(250)
             concentration = _compute_cyq_concentration(df)
             if concentration is None:
                 continue
-            # 写入该股出现的所有 zt_records 日期
             with get_conn() as conn:
                 zt_dates = [r[0] for r in conn.execute(
                     "SELECT DISTINCT date FROM zt_records WHERE code=?", (code,)
                 ).fetchall()]
             if not zt_dates:
                 continue
-            rows = [{"date": d, "code": code, "concentration_90": float(concentration)} for d in zt_dates]
+            rows = [{"date": d, "code": code, "concentration_90": float(concentration)}
+                    for d in zt_dates]
             upsert_cyq_records(rows)
             mark_fetched(key)
             total += len(rows)
