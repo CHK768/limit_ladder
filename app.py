@@ -343,10 +343,7 @@ class StockCard(QFrame):
         price_lbl = QLabel(price_str)
         price_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         price_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        price_lbl.setStyleSheet(
-            f"color:{TEXT}; font-size:10px; background:{SURFACE};"
-            f" border:1px solid {BORDER}; border-radius:4px; padding:1px 4px;"
-        )
+        price_lbl.setStyleSheet(f"color:{TEXT}; font-size:10px;")
 
         pct_val = data.get("pct_change")
         if pct_val is not None:
@@ -1308,7 +1305,7 @@ class LadderTab(QWidget):
             active = (t == self._cyq_threshold)
             if active:
                 btn.setStyleSheet(
-                    f"QPushButton {{ background:{dc}33; color:{dc};"
+                    f"QPushButton {{ background:transparent; color:{dc};"
                     f" border:2px solid {dc}; border-radius:12px;"
                     f" font-size:13px; padding:0; }}"
                 )
