@@ -1428,7 +1428,7 @@ class LadderTab(QWidget):
             return "科创板"
         if code.startswith(("300", "301")):
             return "创业板"
-        if code.startswith(("8", "4")):
+        if code.startswith(("8", "4", "92")):
             return "北交所"
         return "主板"
 
