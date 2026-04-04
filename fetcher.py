@@ -964,14 +964,65 @@ def _compute_cyq_concentration(
     return round((pr1 - pr0) / (pr0 + pr1), 4)
 
 
+def _fetch_kline_with_turnover(code: str, n_days: int = 250) -> "pd.DataFrame | None":
+    """
+    用腾讯日 K JSON 接口获取 OHLCV，再用 zt_records 里的流通市值估算换手率。
+    返回含 open/high/low/close/turnover 列的 DataFrame，失败返回 None。
+    turnover = 日成交量(股) / 流通股数(股)；流通股数 = float_cap(亿元) * 1e8 / price。
+    """
+    from store import get_conn
+    import requests as _r
+
+    # 从 zt_records 取最近一次有效的 float_cap + price 来估算流通股数
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT float_cap, price FROM zt_records
+               WHERE code=? AND float_cap IS NOT NULL AND price IS NOT NULL
+               ORDER BY date DESC LIMIT 1""",
+            (code,),
+        ).fetchone()
+    if row is None:
+        return None
+    float_cap, price = float(row[0]), float(row[1])
+    if float_cap <= 0 or price <= 0:
+        return None
+    float_shares = float_cap * 1e8 / price   # 流通股数（股）
+
+    sym = f"{_market_prefix(code)}{code}"
+    url = (
+        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        f"?param={sym},day,,,{n_days},"
+    )
+    resp = _r.get(url, timeout=10, verify=False)
+    raw = resp.json()
+    records = raw.get("data", {}).get(sym, {}).get("day", [])
+    if not records:
+        return None
+
+    rows = []
+    for r in records:
+        try:
+            vol = float(r[5])
+            rows.append({
+                "open":     float(r[1]),
+                "close":    float(r[2]),
+                "high":     float(r[3]),
+                "low":      float(r[4]),
+                "turnover": min(1.0, vol / float_shares) if float_shares > 0 else 0.0,
+            })
+        except (IndexError, ValueError):
+            continue
+    return pd.DataFrame(rows) if rows else None
+
+
 def fetch_and_store_cyq(
     codes: list[str],
     max_age_hours: float = 48,
     stop_flag=None,
 ) -> int:
     """
-    用 stock_zh_a_daily（新浪/腾讯）获取 OHLCV + 换手率，
-    再用 CYQCalculator 算法近似计算90%筹码集中度。
+    用腾讯日 K JSON（无 py_mini_racer，QThread 安全）+ zt_records 流通市值估算换手率，
+    再用 CYQCalculator 算法计算90%筹码集中度。
     写入该股在 zt_records 中出现的所有日期，确保历史卡片能显示。
     """
     from store import get_conn
@@ -983,12 +1034,8 @@ def fetch_and_store_cyq(
         if is_fetched(key, max_age_hours=max_age_hours):
             continue
         try:
-            sym = f"{_market_prefix(code)}{code}"
-            df = _call_with_timeout(
-                lambda s=sym: ak.stock_zh_a_daily(symbol=s, adjust=""),
-                timeout=30,
-            )
-            if df is None or df.empty or "turnover" not in df.columns:
+            df = _fetch_kline_with_turnover(code)
+            if df is None or df.empty:
                 continue
             concentration = _compute_cyq_concentration(df)
             if concentration is None:
@@ -1006,5 +1053,5 @@ def fetch_and_store_cyq(
             total += len(rows)
         except Exception as e:
             print(f"fetch_cyq {code}: {e}")
-        time.sleep(0.15)
+        time.sleep(0.1)
     return total
