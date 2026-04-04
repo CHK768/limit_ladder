@@ -857,8 +857,8 @@ def fetch_and_store_duanban_pct(
         try:
             prefix = _market_prefix(code)
             df = _call_with_timeout(
-                lambda: ak.stock_zh_a_daily(
-                    symbol=f"{prefix}{code}",
+                lambda c=code, p=prefix: ak.stock_zh_a_daily(
+                    symbol=f"{p}{c}",
                     start_date=date_str,
                     end_date=date_str,
                     adjust="",
@@ -958,13 +958,45 @@ def _compute_cyq_concentration(df: pd.DataFrame) -> float | None:
     return band / center_price
 
 
+def _fetch_tencent_kline(code: str, n_days: int = 250) -> "pd.DataFrame | None":
+    """
+    直接调腾讯日 K JSON 接口获取 OHLCV，绕过 AKShare 内部的日期解析 bug。
+    返回含 open/close/high/low/volume 列的 DataFrame（按时间升序），失败返回 None。
+    """
+    sym = f"{_market_prefix(code)}{code}"
+    url = (
+        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        f"?param={sym},day,,,{n_days},"
+    )
+    import requests as _r
+    resp = _r.get(url, timeout=10, verify=False)
+    raw = resp.json()
+    records = raw.get("data", {}).get(sym, {}).get("day", [])
+    if not records:
+        return None
+    rows = []
+    for r in records:
+        # 每条: [date_str, open, close, high, low, volume, ...]
+        try:
+            rows.append({
+                "open":   float(r[1]),
+                "close":  float(r[2]),
+                "high":   float(r[3]),
+                "low":    float(r[4]),
+                "volume": float(r[5]),
+            })
+        except (IndexError, ValueError):
+            continue
+    return pd.DataFrame(rows) if rows else None
+
+
 def fetch_and_store_cyq(
     codes: list[str],
     max_age_hours: float = 48,
     stop_flag=None,
 ) -> int:
     """
-    用 stock_zh_a_daily（腾讯）+ 本地均匀分布模型近似计算90%筹码集中度。
+    用腾讯日 K JSON 接口 + 本地均匀分布模型近似计算90%筹码集中度。
     对每只股票取最近250个交易日的OHLCV，计算一次集中度，
     写入该股在 zt_records 中出现的所有日期，确保历史卡片也能显示。
     """
@@ -978,12 +1010,12 @@ def fetch_and_store_cyq(
             continue
         try:
             df = _call_with_timeout(
-                lambda c=code: ak.stock_zh_a_daily(symbol=c, adjust="hfq"),
+                lambda c=code: _fetch_tencent_kline(c),
                 timeout=30,
             )
             if df is None or df.empty:
                 continue
-            df = df.sort_values("date").tail(250)
+            df = df.tail(250)
             concentration = _compute_cyq_concentration(df)
             if concentration is None:
                 continue
