@@ -2,10 +2,23 @@
 AKShare 数据获取层
 """
 import json
+import math
 import threading
 import time
+import urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+# 公司网络存在 MITM SSL 代理，Python 的 certifi 无法验证其企业根证书，
+# 导致所有 HTTPS 请求被代理重置（RemoteDisconnected）。
+# 对本地行情工具禁用 SSL 验证是可接受的取舍。
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import requests as _req
+_orig_session_request = _req.Session.request
+def _session_request_no_verify(self, method, url, **kwargs):
+    kwargs.setdefault("verify", False)
+    return _orig_session_request(self, method, url, **kwargs)
+_req.Session.request = _session_request_no_verify
 
 import akshare as ak
 import pandas as pd
@@ -869,18 +882,93 @@ def fetch_and_store_duanban_pct(
 
 # ─────────────────────────── 筹码集中度 ───────────────────────────
 
+def _compute_cyq_concentration(df: pd.DataFrame) -> float | None:
+    """
+    用均匀分布模型近似计算90%筹码集中度（小数形式，如0.08表示8%）。
+    df 须含 close / high / low / volume 列，按日期升序排列。
+    算法：
+      1. 将价格区间[min_low, max_high]分成 N_BUCKETS 个桶
+      2. 每日成交量按[low,high]均匀分配到对应桶
+      3. 从当日收盘价向外扩展，找覆盖90%筹码的最小区间
+      4. 返回 (区间宽度) / (区间中心价) 作为集中度
+    """
+    required = {"close", "high", "low", "volume"}
+    if df is None or df.empty or len(df) < 10:
+        return None
+    if not required.issubset(set(df.columns)):
+        return None
+
+    price_min = float(df["low"].min())
+    price_max = float(df["high"].max())
+    if price_min <= 0 or price_max <= price_min:
+        return None
+
+    N = 500
+    price_range = price_max - price_min
+    buckets = [0.0] * N
+
+    for _, row in df.iterrows():
+        lo = float(row["low"])
+        hi = float(row["high"])
+        vol = float(row["volume"])
+        if vol <= 0:
+            continue
+        if hi <= lo:
+            idx = min(N - 1, int((float(row["close"]) - price_min) / price_range * N))
+            buckets[max(0, idx)] += vol
+            continue
+        vol_per_price = vol / (hi - lo)
+        i_lo = max(0, int((lo - price_min) / price_range * N))
+        i_hi = min(N - 1, int((hi - price_min) / price_range * N))
+        for i in range(i_lo, i_hi + 1):
+            b_lo = price_min + i * price_range / N
+            b_hi = price_min + (i + 1) * price_range / N
+            overlap = min(hi, b_hi) - max(lo, b_lo)
+            if overlap > 0:
+                buckets[i] += vol_per_price * overlap
+
+    total_chips = sum(buckets)
+    if total_chips <= 0:
+        return None
+
+    current_price = float(df["close"].iloc[-1])
+    center_idx = max(0, min(N - 1, int((current_price - price_min) / price_range * N)))
+
+    target = 0.90 * total_chips
+    lo_ptr = center_idx
+    hi_ptr = center_idx
+    covered = buckets[center_idx]
+
+    while covered < target:
+        lo_can = buckets[lo_ptr - 1] if lo_ptr > 0 else -1.0
+        hi_can = buckets[hi_ptr + 1] if hi_ptr < N - 1 else -1.0
+        if lo_can < 0 and hi_can < 0:
+            break
+        if hi_can >= lo_can:
+            hi_ptr += 1
+            covered += buckets[hi_ptr]
+        else:
+            lo_ptr -= 1
+            covered += buckets[lo_ptr]
+
+    band = (hi_ptr - lo_ptr + 1) * price_range / N
+    center_price = price_min + (lo_ptr + hi_ptr) / 2 * price_range / N
+    if center_price <= 0:
+        center_price = current_price
+    return band / center_price
+
+
 def fetch_and_store_cyq(
     codes: list[str],
     max_age_hours: float = 48,
     stop_flag=None,
 ) -> int:
     """
-    直接调用 ak.stock_cyq_em 获取 90% 筹码集中度（需外网访问 EastMoney API）。
-    每只股票以 cyq_code_{code} 为缓存键，max_age_hours 内不重复拉取。
-    stock_cyq_em 返回最近 90 个交易日的集中度，全部存入 cyq_records。
-    返回成功写入的总记录数。
-    注意：stock_cyq_em 使用 py_mini_racer 执行 JS，必须串行调用，不可多线程。
+    用 stock_zh_a_daily（腾讯）+ 本地均匀分布模型近似计算90%筹码集中度。
+    对每只股票取最近250个交易日的OHLCV，计算一次集中度，
+    写入该股在 zt_records 中出现的所有日期，确保历史卡片也能显示。
     """
+    from store import get_conn
     total = 0
     for code in codes:
         if stop_flag and stop_flag():
@@ -890,28 +978,27 @@ def fetch_and_store_cyq(
             continue
         try:
             df = _call_with_timeout(
-                lambda: ak.stock_cyq_em(symbol=code, adjust=""),
+                lambda c=code: ak.stock_zh_a_daily(symbol=c, adjust="hfq"),
                 timeout=30,
             )
-            if df is None or df.empty or "90集中度" not in df.columns:
+            if df is None or df.empty:
                 continue
-            rows = []
-            for _, row in df.iterrows():
-                date_val = row.get("日期")
-                cyq_val = row.get("90集中度")
-                if date_val is None or cyq_val is None or pd.isna(cyq_val):
-                    continue
-                # 日期转 YYYYMMDD 字符串
-                if hasattr(date_val, "strftime"):
-                    date_str = date_val.strftime("%Y%m%d")
-                else:
-                    date_str = str(date_val).replace("-", "")[:8]
-                rows.append({"date": date_str, "code": code, "concentration_90": float(cyq_val)})
-            if rows:
-                upsert_cyq_records(rows)
-                mark_fetched(key)
-                total += len(rows)
+            df = df.sort_values("date").tail(250)
+            concentration = _compute_cyq_concentration(df)
+            if concentration is None:
+                continue
+            # 写入该股出现的所有 zt_records 日期
+            with get_conn() as conn:
+                zt_dates = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT date FROM zt_records WHERE code=?", (code,)
+                ).fetchall()]
+            if not zt_dates:
+                continue
+            rows = [{"date": d, "code": code, "concentration_90": float(concentration)} for d in zt_dates]
+            upsert_cyq_records(rows)
+            mark_fetched(key)
+            total += len(rows)
         except Exception as e:
             print(f"fetch_cyq {code}: {e}")
-        time.sleep(0.1)   # py_mini_racer 需要喘息间隔
+        time.sleep(0.15)
     return total
