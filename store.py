@@ -351,7 +351,7 @@ def get_zt_by_sector_for_date(date: str) -> dict[str, list[dict]]:
     """返回 {sector_name: [stock_dicts]} 涨停个股，用于 tooltip"""
     with get_conn() as c:
         rows = c.execute(
-            """SELECT sc.concept_name, z.code, z.name, z.consecutive_days
+            """SELECT sc.concept_name, z.code, z.name, z.consecutive_days, z.first_limit_time
                FROM zt_records z
                JOIN stock_concepts sc ON sc.code = z.code
                WHERE z.date = ?
