@@ -14,9 +14,10 @@ from PyQt6.QtWidgets import (
     QTabWidget, QScrollArea, QFrame, QSplitter, QStatusBar,
     QLineEdit, QCompleter, QTableWidget, QTableWidgetItem,
     QHeaderView, QSizePolicy, QAbstractScrollArea, QProgressBar,
+    QDialog, QCalendarWidget, QDialogButtonBox,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QStringListModel, QTimer
-from PyQt6.QtGui import QColor, QFont, QBrush
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QStringListModel, QTimer, QDate
+from PyQt6.QtGui import QColor, QFont, QBrush, QTextCharFormat
 
 import store
 import fetcher
@@ -156,6 +157,36 @@ class FetchWorker(QThread):
                         if date_pe:
                             store.upsert_zt_pe(d, date_pe)
 
+            # 补填断板日涨跌幅（最近14天）
+            if not self._stop:
+                all_zt_dates = sorted(store.get_dates_with_zt_data())  # 升序
+                recent = all_zt_dates[-14:] if len(all_zt_dates) > 14 else all_zt_dates
+                for i in range(1, len(recent)):
+                    if self._stop:
+                        break
+                    prev_d = recent[i - 1]
+                    curr_d = recent[i]
+                    prev_zt = store.get_zt_for_dates([prev_d]).get(prev_d, [])
+                    curr_codes = set(store.get_codes_for_date(curr_d))
+                    # 断板股 → {code: 前日ZT收盘价}
+                    code_prev_price = {
+                        s["code"]: s["price"]
+                        for s in prev_zt
+                        if s["code"] not in curr_codes and s.get("price")
+                    }
+                    if not code_prev_price:
+                        continue
+                    self.progress.emit(f"断板涨跌幅 {curr_d}  {len(code_prev_price)}只")
+                    fetcher.fetch_and_store_duanban_pct(
+                        curr_d, code_prev_price, stop_flag=lambda: self._stop
+                    )
+
+            # 补填筹码集中度（全量历史个股，需外网）
+            if not self._stop:
+                all_codes_cyq = store.get_all_zt_codes()
+                self.progress.emit(f"筹码集中度 共{len(all_codes_cyq)}只（需外网）")
+                fetcher.fetch_and_store_cyq(all_codes_cyq, stop_flag=lambda: self._stop)
+
             # 完成后从 DB 取完整日期列表
             result = store.get_dates_with_zt_data()
             self.done.emit(result, new_total)
@@ -254,7 +285,23 @@ class SectorStatsWorker(QThread):
 
 # ──────────────────────────────── 股票卡片 ────────────────────────────────
 
-CARD_W = 158
+CARD_W = 148
+
+
+def _limit_pct_display(code: str, name: str) -> str:
+    """根据代码和名称返回涨停幅度字符串，如 '+10%'"""
+    name_up = (name or "").upper()
+    if "ST" in name_up:
+        pct = 5
+    elif code.startswith(("688", "689")):
+        pct = 20
+    elif code.startswith(("300", "301")):
+        pct = 20
+    elif code.startswith("8"):
+        pct = 30
+    else:
+        pct = 10
+    return f"+{pct}%"
 
 
 class StockCard(QFrame):
@@ -287,12 +334,29 @@ class StockCard(QFrame):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(2)
 
-        # 第一行：代码 + 连板徽章（可点击筛选）
+        # 第一行：价格 + 涨跌幅 + 连板徽章
         row1 = QHBoxLayout()
         row1.setSpacing(4)
 
-        code_lbl = QLabel(data.get("code", ""))
-        code_lbl.setStyleSheet(f"color:{MUTED}; font-size:10px;")
+        price = data.get("price")
+        price_str = f"¥{price:.2f}" if price else "—"
+        price_lbl = QLabel(price_str)
+        price_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        price_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        price_lbl.setStyleSheet(
+            f"color:{TEXT}; font-size:10px; background:{SURFACE};"
+            f" border:1px solid {BORDER}; border-radius:4px; padding:1px 4px;"
+        )
+
+        pct_val = data.get("pct_change")
+        if pct_val is not None:
+            pct_str = f"{pct_val:+.2f}%"
+            pct_color = RED if pct_val > 0 else GREEN if pct_val < 0 else MUTED
+        else:
+            pct_str = _limit_pct_display(data.get("code", ""), data.get("name", ""))
+            pct_color = RED
+        pct_lbl = QLabel(pct_str)
+        pct_lbl.setStyleSheet(f"color:{pct_color}; font-size:10px; font-weight:bold;")
 
         badge = QPushButton(f" {days}板 ")
         badge.setFlat(True)
@@ -306,17 +370,22 @@ class StockCard(QFrame):
         if on_days_click:
             badge.clicked.connect(lambda _=False, d=days: on_days_click(d))
 
-        row1.addWidget(code_lbl)
-        row1.addStretch()
+        row1.addWidget(price_lbl)
+        row1.addWidget(pct_lbl)
         row1.addWidget(badge)
 
-        # 第二行：股票名称
-        name_lbl = QLabel(data.get("name", ""))
-        name_font = QFont()
-        name_font.setBold(True)
-        name_font.setPointSize(12)
-        name_lbl.setFont(name_font)
-        name_lbl.setStyleSheet(f"color:{TEXT};")
+        # 第二行：名称 + 代码胶囊（"平安银行 000001"）
+        name = data.get("name", "")
+        code = data.get("code", "")
+        name_lbl = QLabel(
+            f"<span style='font-weight:bold; font-size:12px; color:{TEXT};'>{name}</span>"
+            f"&nbsp;&nbsp;"
+            f"<span style='font-size:10px; color:{MUTED};'>{code}</span>"
+        )
+        name_lbl.setStyleSheet(
+            f"background:{SURFACE}; border:1px solid {BORDER}; border-radius:8px;"
+            f" padding:2px 7px;"
+        )
         name_lbl.setWordWrap(False)
 
         # 第三行：概念胶囊（前3个，按全局热度排序，颜色跨卡片一致，可点击筛选）
@@ -342,12 +411,11 @@ class StockCard(QFrame):
             pills_row.addWidget(pill)
         pills_row.addStretch()
 
-        # 第四行：市值 + PE + 价格
+        # 第四行：市值 + PE + 集中度
         cap = data.get("float_cap")
-        price = data.get("price")
         pe = data.get("pe")
+        cyq = data.get("concentration_90")
         cap_str = f"{cap:.1f}亿" if cap else "—"
-        price_str = f"¥{price:.2f}" if price else "—"
         if pe is None:
             pe_str = "PE:—"
             pe_color = MUTED
@@ -357,6 +425,23 @@ class StockCard(QFrame):
         else:
             pe_str = f"PE:{pe:.0f}"
             pe_color = MUTED
+        # 集中度：越小越集中，颜色越深（深绿→绿→灰→橙）
+        if cyq is not None:
+            cyq_pct = cyq * 100
+            cyq_str = f"集:{cyq_pct:.1f}%"
+            if cyq_pct <= 3:
+                cyq_color = "#1B5E20"   # 极深绿：高度集中
+            elif cyq_pct <= 6:
+                cyq_color = "#2E7D32"   # 深绿
+            elif cyq_pct <= 10:
+                cyq_color = "#43A047"   # 中绿
+            elif cyq_pct <= 15:
+                cyq_color = MUTED
+            else:
+                cyq_color = ORANGE
+        else:
+            cyq_str = ""
+            cyq_color = MUTED
 
         row4 = QHBoxLayout()
         row4.setSpacing(0)
@@ -364,13 +449,15 @@ class StockCard(QFrame):
         cap_lbl.setStyleSheet(f"color:{MUTED}; font-size:10px;")
         pe_lbl = QLabel(pe_str)
         pe_lbl.setStyleSheet(f"color:{pe_color}; font-size:10px;")
-        price_lbl = QLabel(price_str)
-        price_lbl.setStyleSheet(f"color:{RED}; font-size:10px; font-weight:bold;")
         row4.addWidget(cap_lbl)
         row4.addStretch()
         row4.addWidget(pe_lbl)
+        if cyq_str:
+            row4.addStretch()
+            cyq_lbl = QLabel(cyq_str)
+            cyq_lbl.setStyleSheet(f"color:{cyq_color}; font-size:10px; font-weight:bold;")
+            row4.addWidget(cyq_lbl)
         row4.addStretch()
-        row4.addWidget(price_lbl)
 
         layout.addLayout(row1)
         layout.addWidget(name_lbl)
@@ -393,7 +480,7 @@ class StockCard(QFrame):
 
 # ──────────────────────────────── 日期列 ────────────────────────────────
 
-COL_W = CARD_W + 16
+COL_W = CARD_W
 
 
 HEADER_H = 48  # 日期头（日期行 + 数量行）总高度
@@ -429,7 +516,7 @@ class DayColumn(QWidget):
             concept_heat = {}
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 8, 0)
+        outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
         # ── 日期头 ──
@@ -570,6 +657,16 @@ class DayColumn(QWidget):
                 name_lbl = QLabel(s.get("name", ""))
                 name_lbl.setStyleSheet(f"color:{MUTED}; font-size:11px;")
 
+                db_pct = s.get("duanban_pct")
+                if db_pct is not None:
+                    db_pct_str = f"{db_pct:+.2f}%"
+                    db_pct_color = RED if db_pct > 0 else GREEN if db_pct < 0 else MUTED
+                else:
+                    db_pct_str = "—"
+                    db_pct_color = MUTED
+                db_pct_lbl = QLabel(db_pct_str)
+                db_pct_lbl.setStyleSheet(f"color:{db_pct_color}; font-size:9px; font-weight:bold;")
+
                 days_lbl = QLabel(f"<s>{days}板</s>")
                 days_lbl.setTextFormat(Qt.TextFormat.RichText)
                 days_lbl.setStyleSheet(
@@ -578,6 +675,7 @@ class DayColumn(QWidget):
                 )
 
                 rl.addWidget(name_lbl, 1)
+                rl.addWidget(db_pct_lbl)
                 rl.addWidget(days_lbl)
                 outer.addWidget(row_w)
 
@@ -828,6 +926,33 @@ class LadderTab(QWidget):
         self._days_filter.changed.connect(self._apply_filters)
         lv.addWidget(self._days_filter)
 
+        # 市场板块
+        lv.addWidget(self._section("市场板块"))
+        _mkt_style = (
+            f"QPushButton {{ background:{SURFACE}; color:{MUTED};"
+            f" border:1px solid {BORDER}; border-radius:4px; font-size:11px; }}"
+            f"QPushButton:checked {{ background:{ACCENT}; color:white;"
+            f" border:1px solid {ACCENT}; font-weight:bold; }}"
+        )
+        self._market_filter: set[str] = set()
+        self._market_btns: dict[str, QPushButton] = {}
+        mkt_row1 = QHBoxLayout()
+        mkt_row1.setSpacing(4)
+        mkt_row2 = QHBoxLayout()
+        mkt_row2.setSpacing(4)
+        for label, row in [("主板", mkt_row1), ("创业板", mkt_row1),
+                            ("科创板", mkt_row2), ("北交所", mkt_row2)]:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setFixedHeight(26)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(_mkt_style)
+            btn.clicked.connect(self._on_market_filter_changed)
+            self._market_btns[label] = btn
+            row.addWidget(btn)
+        lv.addLayout(mkt_row1)
+        lv.addLayout(mkt_row2)
+
         # 流通市值
         lv.addWidget(self._section("流通市值（亿元）"))
         row_cap = QHBoxLayout()
@@ -873,6 +998,35 @@ class LadderTab(QWidget):
         row_pe.addWidget(self._range_dash())
         row_pe.addWidget(self._max_pe)
         lv.addLayout(row_pe)
+
+        # 90% 筹码集中度 — 彩点横向（6档，蓝色深→浅）
+        lv.addWidget(self._section("筹码集中度"))
+        self._cyq_threshold: int | None = None
+        self._cyq_btns: dict = {}
+        _cyq_opts = [
+            (None, "#B0B0B0", "不限"),
+            (3,    "#1E3A8A", "≤3%"),
+            (8,    "#1E40AF", "≤8%"),
+            (15,   "#2563EB", "≤15%"),
+            (20,   "#3B82F6", "≤20%"),
+            (30,   "#93C5FD", "≤30%"),
+        ]
+        cyq_dot_row = QHBoxLayout()
+        cyq_dot_row.setSpacing(4)
+        cyq_dot_row.setContentsMargins(0, 0, 0, 0)
+        for _t, _dc, _tip in _cyq_opts:
+            btn = QPushButton("●")
+            btn.setFixedSize(24, 24)
+            btn.setToolTip(_tip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn._threshold = _t
+            btn._dot_color = _dc
+            btn.clicked.connect(lambda _, t=_t: self._on_cyq_filter_click(t))
+            self._cyq_btns[_t] = btn
+            cyq_dot_row.addWidget(btn)
+        cyq_dot_row.addStretch()
+        lv.addLayout(cyq_dot_row)
+        self._update_cyq_row_styles()
 
         # 概念口径切换
         lv.addWidget(self._section("概念口径"))
@@ -959,12 +1113,18 @@ class LadderTab(QWidget):
             btn.setFixedHeight(28)
         self._prev_btn.clicked.connect(self._page_next)
         self._next_btn.clicked.connect(self._page_prev)
-        self._date_lbl = QLabel("—")
-        self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._date_lbl.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+        self._date_btn = QPushButton("—")
+        self._date_btn.setFlat(True)
+        self._date_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._date_btn.setToolTip("点击选择日期")
+        self._date_btn.setStyleSheet(
+            f"QPushButton {{ color:{MUTED}; font-size:11px; background:transparent; border:none; }}"
+            f"QPushButton:hover {{ color:{ACCENT}; text-decoration:underline; }}"
+        )
+        self._date_btn.clicked.connect(self._show_date_picker)
         nav.addWidget(self._prev_btn)
         nav.addStretch()
-        nav.addWidget(self._date_lbl)
+        nav.addWidget(self._date_btn)
         nav.addStretch()
         nav.addWidget(self._next_btn)
 
@@ -990,7 +1150,7 @@ class LadderTab(QWidget):
         self._ladder_inner.setStyleSheet(f"background:{BG};")
         self._ladder_hbox = QHBoxLayout(self._ladder_inner)
         self._ladder_hbox.setContentsMargins(8, 8, 8, 8)
-        self._ladder_hbox.setSpacing(0)
+        self._ladder_hbox.setSpacing(6)
         self._ladder_hbox.addStretch()
         self._ladder_scroll.setWidget(self._ladder_inner)
         rv.addWidget(self._ladder_scroll, 1)
@@ -1086,12 +1246,12 @@ class LadderTab(QWidget):
         dates = self._current_page_dates()
         self._current_dates = dates
         if dates:
-            self._date_lbl.setText(
+            self._date_btn.setText(
                 f"{dates[0][:4]}-{dates[0][4:6]}-{dates[0][6:]} ~ "
                 f"{dates[-1][:4]}-{dates[-1][4:6]}-{dates[-1][6:]}"
             )
         else:
-            self._date_lbl.setText("无数据")
+            self._date_btn.setText("无数据")
 
         # 同时拉取每日的前一交易日数据（用于断板计算）
         self._prev_date_map: dict[str, str | None] = {}
@@ -1105,6 +1265,12 @@ class LadderTab(QWidget):
         fetch_dates = list(dates) + extra_prev
         raw = store.get_zt_for_dates(fetch_dates)
 
+        # 加载断板涨跌幅（断板发生日 → {code: pct_change}）
+        self._duanban_pct_map = store.get_duanban_pct_for_dates(fetch_dates)
+
+        # 加载筹码集中度（{date: {code: concentration_90}}）
+        self._cyq_map = store.get_cyq_for_dates(fetch_dates)
+
         # 附加概念信息
         all_codes = {s["code"] for stocks in raw.values() for s in stocks}
         _src = None if self._concept_source == 'all' else self._concept_source
@@ -1113,7 +1279,9 @@ class LadderTab(QWidget):
         concept_heat = store.get_concept_global_heat(source=_src)
         self._concept_heat = concept_heat
 
+        cyq_map = getattr(self, "_cyq_map", {})
         for date, stocks in raw.items():
+            date_cyq = cyq_map.get(date, {})
             for s in stocks:
                 code = s["code"]
                 concepts = concept_map.get(code, [])
@@ -1122,9 +1290,51 @@ class LadderTab(QWidget):
                     s["primary_concept"] = max(concepts, key=lambda c: concept_heat.get(c, 0))
                 else:
                     s["primary_concept"] = "N/A"
+                cyq_val = date_cyq.get(code)
+                if cyq_val is not None:
+                    s["concentration_90"] = cyq_val
 
         self._full_data = raw
         self._apply_filters()
+
+    def _on_cyq_filter_click(self, threshold):
+        self._cyq_threshold = threshold
+        self._update_cyq_row_styles()
+        self._apply_filters()
+
+    def _update_cyq_row_styles(self):
+        for t, btn in self._cyq_btns.items():
+            dc = btn._dot_color
+            active = (t == self._cyq_threshold)
+            if active:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background:{dc}33; color:{dc};"
+                    f" border:2px solid {dc}; border-radius:12px;"
+                    f" font-size:13px; padding:0; }}"
+                )
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background:transparent; color:{dc};"
+                    f" border:2px solid transparent; border-radius:12px;"
+                    f" font-size:13px; padding:0; }}"
+                    f"QPushButton:hover {{ border:2px solid {dc}; }}"
+                )
+
+    def _on_market_filter_changed(self):
+        self._market_filter = {
+            label for label, btn in self._market_btns.items() if btn.isChecked()
+        }
+        self._apply_filters()
+
+    @staticmethod
+    def _code_market(code: str) -> str:
+        if code.startswith(("688", "689")):
+            return "科创板"
+        if code.startswith(("300", "301")):
+            return "创业板"
+        if code.startswith(("8", "4")):
+            return "北交所"
+        return "主板"
 
     def _apply_filters(self, *_):
         min_cap = self._min_cap.value()
@@ -1136,6 +1346,8 @@ class LadderTab(QWidget):
         max_pe = self._max_pe.value()
         positive_pe_filter_active = not (min_pe == 0 and max_pe == 9999)
         pe_filter_active = include_loss or positive_pe_filter_active
+        cyq_threshold = self._cyq_threshold
+        cyq_filter_active = cyq_threshold is not None
         sectors = self._sector_filter.get_selected()
 
         def _passes(s: dict) -> bool:
@@ -1143,6 +1355,8 @@ class LadderTab(QWidget):
             cap = s.get("float_cap") or 0
             price = s.get("price") or 0
             if self._stock_code_filter and s.get("code") != self._stock_code_filter:
+                return False
+            if self._market_filter and self._code_market(s.get("code", "")) not in self._market_filter:
                 return False
             if not self._days_filter.matches(days):
                 return False
@@ -1162,6 +1376,12 @@ class LadderTab(QWidget):
                         return False
                     if not (min_pe <= pe <= max_pe):
                         return False
+            if cyq_filter_active:
+                cyq = s.get("concentration_90")
+                if cyq is None:
+                    return False
+                if cyq * 100 > cyq_threshold:
+                    return False
             if sectors:
                 sc = set(s.get("all_concepts", []))
                 if not sc.issuperset(sectors):
@@ -1215,12 +1435,15 @@ class LadderTab(QWidget):
 
         # 计算各日断板（昨日在涨停池、今日不在），同步应用筛选条件
         duanban_by_date: dict[str, list[dict]] = {}
+        duanban_pct_map = getattr(self, "_duanban_pct_map", {})
         for date in self._current_dates:
             prev_d = getattr(self, "_prev_date_map", {}).get(date)
             if prev_d and prev_d in self._full_data:
                 today_codes = {s["code"] for s in self._full_data.get(date, [])}
+                pct_for_date = duanban_pct_map.get(date, {})
                 duanban_by_date[date] = [
-                    s for s in self._full_data[prev_d]
+                    {**s, "duanban_pct": pct_for_date.get(s["code"])}
+                    for s in self._full_data[prev_d]
                     if s["code"] not in today_codes and _passes(s)
                 ]
             else:
@@ -1247,9 +1470,20 @@ class LadderTab(QWidget):
             w.deleteLater()
         self._col_widgets.clear()
 
+    def _show_date_picker(self):
+        dlg = _DatePickerDialog(self._all_dates, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            chosen = dlg.selected_date()  # "YYYYMMDD"
+            if chosen and chosen in self._all_dates:
+                self._page_offset = self._all_dates.index(chosen)
+                self._refresh_page()
+
     def _reset_filters(self):
         self._clear_stock_filter()
         self._days_filter.clear()
+        self._market_filter = set()
+        for btn in self._market_btns.values():
+            btn.setChecked(False)
         self._min_cap.setValue(0)
         self._max_cap.setValue(99999)
         self._min_price.setValue(0)
@@ -1319,6 +1553,96 @@ class _NumericItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+class _DatePickerDialog(QDialog):
+    """弹出式日历，让用户选择一个交易日并跳转。非交易日和未来日期显示为灰色。"""
+
+    def __init__(self, all_dates: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择日期")
+        self.setModal(True)
+        self._all_dates = all_dates          # 降序，最新在前
+        self._date_set = set(all_dates)      # 快速查询
+        self._chosen: str | None = None
+
+        # 灰色格式（无数据日期）：文字灰色
+        self._gray_fmt = QTextCharFormat()
+        self._gray_fmt.setForeground(QBrush(QColor("#C8C8C8")))
+
+        # 有数据日期：蓝色背景框出，形成可视区间块
+        self._normal_fmt = QTextCharFormat()
+        self._normal_fmt.setBackground(QBrush(QColor("#DBEAFE")))   # 淡蓝底
+        self._normal_fmt.setForeground(QBrush(QColor("#1E40AF")))   # 深蓝字
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        self._cal = QCalendarWidget()
+        self._cal.setGridVisible(True)
+        self._cal.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+
+        # 日期格字体 9pt，导航栏"年月"标题 11pt（大2号）
+        cal_font = self._cal.font()
+        cal_font.setPointSize(9)
+        self._cal.setFont(cal_font)
+        self._cal.setStyleSheet(
+            "QCalendarWidget QToolButton#qt_calendar_monthbutton,"
+            "QCalendarWidget QToolButton#qt_calendar_yearbutton {"
+            "  font-size: 11pt; font-weight: bold;"
+            "}"
+        )
+
+        if all_dates:
+            newest = all_dates[0]
+            oldest = all_dates[-1]
+            oldest_qdate = QDate(int(oldest[:4]), int(oldest[4:6]), int(oldest[6:]))
+            newest_qdate = QDate(int(newest[:4]), int(newest[4:6]), int(newest[6:]))
+            self._cal.setMinimumDate(oldest_qdate)
+            self._cal.setMaximumDate(newest_qdate)
+            self._cal.setSelectedDate(newest_qdate)
+            # 一次性把全范围内所有日期都灰掉，再亮显有数据的日期
+            # 这样无论用户切换到哪个月，格式都是正确的
+            self._apply_all_formats(oldest_qdate, newest_qdate)
+
+        self._cal.clicked.connect(self._on_date_clicked)
+        layout.addWidget(self._cal)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _apply_all_formats(self, oldest_qdate: QDate, newest_qdate: QDate):
+        """一次性灰掉整个范围内所有日期，再亮显 date_set 中的有数据日期。"""
+        # 覆盖前后各14天，确保日历边缘溢出格也被格式化
+        d = oldest_qdate.addDays(-14)
+        end = newest_qdate.addDays(14)
+        while d <= end:
+            date_str = d.toString("yyyyMMdd")
+            fmt = self._normal_fmt if date_str in self._date_set else self._gray_fmt
+            self._cal.setDateTextFormat(d, fmt)
+            d = d.addDays(1)
+
+    def _on_date_clicked(self, qdate: QDate):
+        self._chosen = qdate.toString("yyyyMMdd")
+
+    def _on_accept(self):
+        qdate = self._cal.selectedDate()
+        chosen = qdate.toString("yyyyMMdd")
+        if chosen in self._date_set:
+            self._chosen = chosen
+        else:
+            # 取 <= chosen 的最近交易日
+            candidates = [d for d in self._all_dates if d <= chosen]
+            self._chosen = candidates[0] if candidates else (self._all_dates[0] if self._all_dates else None)
+        self.accept()
+
+    def selected_date(self) -> str | None:
+        return self._chosen
+
+
 class SectorTab(QWidget):
     """板块日统计 Tab：板块为行、日期为列，横向对齐同一板块。"""
 
@@ -1348,12 +1672,18 @@ class SectorTab(QWidget):
             btn.setFixedHeight(28)
         self._prev_btn.clicked.connect(self._page_next)
         self._next_btn.clicked.connect(self._page_prev)
-        self._date_lbl = QLabel("—")
-        self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._date_lbl.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+        self._date_btn = QPushButton("—")
+        self._date_btn.setFlat(True)
+        self._date_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._date_btn.setToolTip("点击选择日期")
+        self._date_btn.setStyleSheet(
+            f"QPushButton {{ color:{MUTED}; font-size:11px; background:transparent; border:none; }}"
+            f"QPushButton:hover {{ color:{ACCENT}; text-decoration:underline; }}"
+        )
+        self._date_btn.clicked.connect(self._show_date_picker)
         nav.addWidget(self._prev_btn)
         nav.addStretch()
-        nav.addWidget(self._date_lbl)
+        nav.addWidget(self._date_btn)
         nav.addStretch()
         nav.addWidget(self._next_btn)
         nav_frame = QFrame()
@@ -1436,11 +1766,11 @@ class SectorTab(QWidget):
     def _rebuild(self):
         dates = self._current_page_dates()   # 升序：最早在左
         if not dates:
-            self._date_lbl.setText("无数据")
+            self._date_btn.setText("无数据")
             return
 
         # dates[0] 最新，dates[-1] 最旧
-        self._date_lbl.setText(
+        self._date_btn.setText(
             f"{dates[0][:4]}-{dates[0][4:6]}-{dates[0][6:]} ~ "
             f"{dates[-1][:4]}-{dates[-1][4:6]}-{dates[-1][6:]}"
         )
@@ -1595,13 +1925,21 @@ class SectorTab(QWidget):
         self._page_offset = new_off
         self._rebuild()
 
+    def _show_date_picker(self):
+        dlg = _DatePickerDialog(self._all_dates, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            chosen = dlg.selected_date()  # "YYYYMMDD"
+            if chosen and chosen in self._all_dates:
+                self._page_offset = self._all_dates.index(chosen)
+                self._rebuild()
+
 
 # ──────────────────────────────── 主窗口 ────────────────────────────────
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("连板")
+        self.setWindowTitle("连板天梯")
         self.resize(1440, 900)
 
         self._fetch_worker: FetchWorker | None = None
@@ -1673,7 +2011,7 @@ class MainWindow(QMainWindow):
         )
         tv = QHBoxLayout(top_bar)
         tv.setContentsMargins(16, 0, 16, 0)
-        title = QLabel("连板")
+        title = QLabel("连板天梯")
         title.setStyleSheet("color:white; font-size:16px; font-weight:bold;")
         self._status_lbl = QLabel("就绪")
         self._status_lbl.setStyleSheet("color:#AAAAAA; font-size:11px;")
@@ -1710,7 +2048,7 @@ class MainWindow(QMainWindow):
         self._ladder_tab = LadderTab()
         self._ladder_tab.status_msg.connect(self._set_status)
         self._sector_tab = SectorTab()
-        self._tabs.addTab(self._ladder_tab, "连板")
+        self._tabs.addTab(self._ladder_tab, "连板天梯")
         self._tabs.addTab(self._sector_tab, "板块日统计")
         cv.addWidget(self._tabs, 1)
 
@@ -1869,7 +2207,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("连板")
+    app.setApplicationName("连板天梯")
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
