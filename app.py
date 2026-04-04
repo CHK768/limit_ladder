@@ -422,20 +422,22 @@ class StockCard(QFrame):
         else:
             pe_str = f"PE:{pe:.0f}"
             pe_color = MUTED
-        # 集中度：越小越集中，颜色越深（深绿→绿→灰→橙）
+        # 集中度：越小越集中，颜色越深（深蓝→浅蓝→灰）与滤镜彩点配色一致
         if cyq is not None:
             cyq_pct = cyq * 100
             cyq_str = f"集:{cyq_pct:.1f}%"
             if cyq_pct <= 3:
-                cyq_color = "#1B5E20"   # 极深绿：高度集中
-            elif cyq_pct <= 6:
-                cyq_color = "#2E7D32"   # 深绿
-            elif cyq_pct <= 10:
-                cyq_color = "#43A047"   # 中绿
+                cyq_color = "#1E3A8A"
+            elif cyq_pct <= 8:
+                cyq_color = "#1E40AF"
             elif cyq_pct <= 15:
-                cyq_color = MUTED
+                cyq_color = "#2563EB"
+            elif cyq_pct <= 20:
+                cyq_color = "#3B82F6"
+            elif cyq_pct <= 30:
+                cyq_color = "#93C5FD"
             else:
-                cyq_color = ORANGE
+                cyq_color = MUTED
         else:
             cyq_str = ""
             cyq_color = MUTED
