@@ -613,10 +613,12 @@ def fetch_range(
 # ─────────────────────── 历史涨停（日K反推）───────────────────────
 
 def _market_prefix(code: str) -> str:
-    """返回腾讯/新浪行情接口所需市场前缀"""
-    if code.startswith(("6", "9")):
+    """返回腾讯行情接口所需市场前缀（sh/sz/bj）"""
+    if code.startswith(("43", "83", "87", "92")):  # 北交所（含新代码段 92xxxx）
+        return "bj"
+    if code.startswith(("6", "9")):                 # 上交所
         return "sh"
-    return "sz"
+    return "sz"                                      # 深交所
 
 
 def _get_limit_pct(code: str, name: str) -> float:
@@ -853,20 +855,34 @@ def fetch_and_store_duanban_pct(
             continue
         try:
             prefix = _market_prefix(code)
-            df = _call_with_timeout(
-                lambda c=code, p=prefix: ak.stock_zh_a_daily(
-                    symbol=f"{p}{c}",
-                    start_date=date_str,
-                    end_date=date_str,
-                    adjust="",
-                ),
-                timeout=12,
-            )
-            if df is not None and not df.empty:
-                today_close = _safe_float(df.iloc[-1]["close"])
-                if today_close and today_close > 0:
-                    pct = round((today_close - prev_close) / prev_close * 100, 2)
-                    rows.append({"date": date_str, "code": code, "pct_change": pct})
+            today_close = None
+            if prefix == "bj":
+                # 北交所：stock_zh_a_daily 不支持，改用腾讯 proxy kline
+                sym = f"bj{code}"
+                url = (f"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+                       f"?_var=x&param={sym},day,,,5,&cb=&r=0.1")
+                resp = _req.get(url, timeout=12, verify=False)
+                text = resp.text[2:] if resp.text.startswith("x=") else resp.text
+                krows = json.loads(text).get("data", {}).get(sym, {}).get("day", [])
+                for r in krows:
+                    if str(r[0]).replace("-", "")[:8] == date_str:
+                        today_close = _safe_float(r[2])
+                        break
+            else:
+                df = _call_with_timeout(
+                    lambda c=code, p=prefix: ak.stock_zh_a_daily(
+                        symbol=f"{p}{c}",
+                        start_date=date_str,
+                        end_date=date_str,
+                        adjust="",
+                    ),
+                    timeout=12,
+                )
+                if df is not None and not df.empty:
+                    today_close = _safe_float(df.iloc[-1]["close"])
+            if today_close and today_close > 0:
+                pct = round((today_close - prev_close) / prev_close * 100, 2)
+                rows.append({"date": date_str, "code": code, "pct_change": pct})
         except Exception as e:
             print(f"fetch_duanban_pct {code} {date_str}: {e}")
         time.sleep(0.05)
