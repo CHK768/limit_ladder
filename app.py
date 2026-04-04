@@ -2374,14 +2374,17 @@ class FactorTab(QWidget):
         self._prev_btn.setEnabled(self._page_offset > 0)
         self._next_btn.setEnabled(end < len(self._all_dates))
 
-        # 最新日晋级判断：需要 page_offset 前一格（更新的那天）
-        extra_recent: list[str] = []
+        # 次日晋级 + 下周晋级：往更新方向取最多6格（1格用于次日，最多5格用于下周）
+        extra_week: list[str] = []   # 最多5个更新的交易日（降序），用于下周连板率
         if self._page_offset > 0:
-            extra_recent = [self._all_dates[self._page_offset - 1]]
+            end        = self._page_offset
+            start      = max(0, self._page_offset - 5)
+            extra_week = self._all_dates[start:end]  # DESC，最新在前
+        extra_recent = extra_week[:1]                # 仅最新1天用于次日判定
 
-        fetch_dates = list(analysis_dates) + extra_recent
+        fetch_dates = list(analysis_dates) + extra_week   # 一次拉取全部所需日期
         zt_by_date  = store.get_zt_for_dates(fetch_dates)
-        cyq_by_date = store.get_cyq_for_dates(fetch_dates)
+        cyq_by_date = store.get_cyq_for_dates(list(analysis_dates))  # CYQ 只看当前窗口
 
         all_codes: set[str] = set()
         for d in analysis_dates:
@@ -2390,8 +2393,13 @@ class FactorTab(QWidget):
 
         concept_map = store.get_stock_concepts(list(all_codes))
 
-        # 构建 (date, code) 记录，analysis_dates 是 DESC
-        # "下一交易日（更新）" = analysis_dates[i-1]（i>0），最新日用 extra_recent
+        def _market(code: str) -> str:
+            if code.startswith(("43", "83", "87", "92")): return "北交所"
+            if code.startswith(("300", "301")):            return "创业板"
+            if code.startswith("688"):                     return "科创板"
+            return "主板"
+
+        # 构建本周 (date, code) 记录，analysis_dates 是 DESC
         records: list[dict] = []
         for i, d in enumerate(analysis_dates):
             if i == 0:
@@ -2407,19 +2415,11 @@ class FactorTab(QWidget):
 
             for row in zt_by_date.get(d, []):
                 code = row["code"]
-                if code.startswith(("43", "83", "87", "92")):
-                    market = "北交所"
-                elif code.startswith(("300", "301")):
-                    market = "创业板"
-                elif code.startswith("688"):
-                    market = "科创板"
-                else:
-                    market = "主板"
-
                 records.append({
                     "date":          d,
                     "code":          code,
-                    "market":        market,
+                    "name":          row.get("name", ""),
+                    "market":        _market(code),
                     "float_cap":     row.get("float_cap"),
                     "price":         row.get("price"),
                     "pe":            row.get("pe"),
@@ -2428,6 +2428,38 @@ class FactorTab(QWidget):
                     "concepts":      concept_map.get(code, []),
                     "promoted":      (code in next_codes) if has_next else None,
                     "has_next":      has_next,
+                })
+
+        # 构建下周记录（extra_week 内部的次日晋级，用于因子组合下周表现对比）
+        nw_codes: set[str] = set()
+        for d in extra_week:
+            for row in zt_by_date.get(d, []):
+                nw_codes.add(row["code"])
+        nw_concept_map = store.get_stock_concepts(list(nw_codes)) if nw_codes else {}
+
+        next_week_records: list[dict] = []
+        for i, d in enumerate(extra_week):   # DESC：extra_week[0] 最新
+            if i == 0:
+                nw_next_codes = set()
+                nw_has_next   = False
+            else:
+                nw_next_codes = {r["code"] for r in zt_by_date.get(extra_week[i - 1], [])}
+                nw_has_next   = True
+            for row in zt_by_date.get(d, []):
+                code = row["code"]
+                next_week_records.append({
+                    "date":          d,
+                    "code":          code,
+                    "name":          row.get("name", ""),
+                    "market":        _market(code),
+                    "float_cap":     row.get("float_cap"),
+                    "price":         row.get("price"),
+                    "pe":            row.get("pe"),
+                    "consecutive":   row.get("consecutive_days", 1),
+                    "concentration": None,   # 不额外拉 CYQ
+                    "concepts":      nw_concept_map.get(code, []),
+                    "promoted":      (code in nw_next_codes) if nw_has_next else None,
+                    "has_next":      nw_has_next,
                 })
 
         known_date_set = {r["date"] for r in records if r["has_next"]}
@@ -2441,10 +2473,15 @@ class FactorTab(QWidget):
             self._scroll.setWidget(content)
             return
 
+        # ── 最优因子组合分析（独占顶部一整行）──
+        s_combo = self._build_combo_analysis(records, next_week_records)
+        AT = Qt.AlignmentFlag.AlignTop
+        grid.addWidget(s_combo, 0, 0, 1, 2, AT)
+
         # 信息头
         info = QLabel(f"共 {len(known)} 条有效记录  ·  连板率 = 次日继续涨停的概率")
         info.setStyleSheet(f"color:{MUTED}; font-size:11px; padding:2px 0 6px 0;")
-        grid.addWidget(info, 0, 0, 1, 2)
+        grid.addWidget(info, 1, 0, 1, 2)
 
         # col_dates: 列顺序用时间升序（左旧右新），analysis_dates 是 DESC 需要反转
         col_dates = list(reversed(analysis_dates))
@@ -2460,15 +2497,14 @@ class FactorTab(QWidget):
         s_concept = self._build_section("概念板块（Top 15）", self._rows_concept(records), **kw)
 
         # 2 列网格排列（AlignTop 确保各格子顶部对齐，不被拉伸）
-        AT = Qt.AlignmentFlag.AlignTop
-        grid.addWidget(s_market,  1, 0, AT)
-        grid.addWidget(s_consec,  1, 1, AT)
-        grid.addWidget(s_price,   2, 0, AT)
-        grid.addWidget(s_fcap,    2, 1, AT)
-        grid.addWidget(s_pe,      3, 0, AT)
-        grid.addWidget(s_cyq,     3, 1, AT)
-        grid.addWidget(s_concept, 4, 0, 1, 2)   # 概念独占一整行
-        grid.setRowStretch(5, 1)
+        grid.addWidget(s_market,  2, 0, AT)
+        grid.addWidget(s_consec,  2, 1, AT)
+        grid.addWidget(s_price,   3, 0, AT)
+        grid.addWidget(s_fcap,    3, 1, AT)
+        grid.addWidget(s_pe,      4, 0, AT)
+        grid.addWidget(s_cyq,     4, 1, AT)
+        grid.addWidget(s_concept, 5, 0, 1, 2)   # 概念独占一整行
+        grid.setRowStretch(6, 1)
 
         self._scroll.setWidget(content)
 
@@ -2480,6 +2516,42 @@ class FactorTab(QWidget):
         total = len(grp)
         promoted = sum(1 for r in grp if r["promoted"])
         return total, promoted, (promoted / total * 100) if total else 0.0
+
+    @staticmethod
+    def _stocks_tooltip(grp: list[dict], week: bool = False) -> str:
+        """生成悬浮提示：逐行列出个股（有晋级数据时加 ✓/✗ 标记）。
+        week=True 时使用 promoted_week / has_next_week 字段。
+        """
+        hk = "has_next_week" if week else "has_next"
+        pk = "promoted_week" if week else "promoted"
+        known = [r for r in grp if r.get(hk)]
+        total = len(grp)
+        label = "下周出现涨停" if week else "晋级"
+        if known:
+            prm  = sum(1 for r in known if r.get(pk))
+            rate = prm / len(known) * 100
+            header = f"共 {total} 只 · {label} {prm}/{len(known)} = {rate:.0f}%\n{'─' * 30}"
+        else:
+            header = f"共 {total} 只（无{'下周' if week else '晋级'}数据）\n{'─' * 30}"
+
+        lines = [header]
+        def sort_key(r):
+            if not r.get(hk): return 2
+            return 0 if r.get(pk) else 1
+        for r in sorted(grp, key=sort_key):
+            code   = r["code"]
+            name   = r["name"] or code
+            cons   = r["consecutive"]
+            d      = r["date"]
+            date_s = f"{d[4:6]}/{d[6:8]}"
+            if not r.get(hk):
+                mark = "  "
+            elif r.get(pk):
+                mark = "✓"
+            else:
+                mark = "✗"
+            lines.append(f"{mark} {code} {name}  {cons}板  {date_s}")
+        return "\n".join(lines)
 
     @staticmethod
     def _pearson(records: list[dict], key: str) -> float | None:
@@ -2577,6 +2649,324 @@ class FactorTab(QWidget):
             if grp:
                 rows.append((label, grp))
         return rows
+
+    # ── 辅助：最优因子组合分析 ──
+
+    def _build_combo_analysis(self, records: list[dict],
+                              next_week_records: list[dict] | None = None) -> QFrame:
+        """枚举单因子 + 双因子组合，按合计连板率降序展示 Top N。
+        next_week_records：下一周同窗口的涨停记录，用于计算相同因子组合的下周连板率。
+        """
+        MIN_SAMPLE = 5
+        TOP_N      = 8
+
+        # 因子标签映射
+        def fcap_label(v):
+            if v is None: return None
+            if v < 20:  return "< 20亿"
+            if v < 50:  return "20~50亿"
+            if v < 100: return "50~100亿"
+            if v < 300: return "100~300亿"
+            if v < 500: return "300~500亿"
+            return "> 500亿"
+
+        def price_label(v):
+            if v is None: return None
+            if v < 10:  return "< 10元"
+            if v < 20:  return "10~20元"
+            if v < 50:  return "20~50元"
+            if v < 100: return "50~100元"
+            return "> 100元"
+
+        def pe_label(v):
+            if v is None: return None
+            if v < 0:   return "亏损"
+            if v < 30:  return "0~30"
+            if v < 60:  return "30~60"
+            if v < 100: return "60~100"
+            if v < 200: return "100~200"
+            return "> 200"
+
+        def cyq_label(v):
+            if v is None: return None
+            if v <= 0.03: return "≤ 3%"
+            if v <= 0.08: return "3~8%"
+            if v <= 0.15: return "8~15%"
+            if v <= 0.20: return "15~20%"
+            if v <= 0.30: return "20~30%"
+            return "> 30%"
+
+        FACTOR_DEFS = [
+            ("market",        "市场",      lambda r: r["market"]),
+            ("consecutive",   "连板数",    lambda r: f"{r['consecutive']}板" if r["consecutive"] is not None else None),
+            ("float_cap",     "流通市值",  lambda r: fcap_label(r["float_cap"])),
+            ("price",         "股价",      lambda r: price_label(r["price"])),
+            ("pe",            "市盈率",    lambda r: pe_label(r["pe"])),
+            ("concentration", "筹码集中度",lambda r: cyq_label(r["concentration"])),
+            ("concept",       "主概念",    lambda r: r["concepts"][0] if r.get("concepts") else None),
+        ]
+
+        known = [r for r in records if r["has_next"]]
+
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame {{ background:{BG}; border:1px solid {ACCENT}55;"
+            f" border-radius:8px; }}"
+        )
+        fv = QVBoxLayout(frame)
+        fv.setContentsMargins(0, 0, 0, 0)
+        fv.setSpacing(0)
+
+        # 标题行
+        hdr_w = QWidget()
+        hdr_w.setStyleSheet(
+            f"background:{ACCENT}12; border-radius:8px 8px 0 0;"
+            f" border-bottom:1px solid {ACCENT}30;"
+        )
+        hdr_h = QHBoxLayout(hdr_w)
+        hdr_h.setContentsMargins(14, 8, 14, 8)
+        title_lbl = QLabel(f"连板率最高的因子组合分析  （合计连板率前{TOP_N}，最小样本 ≥ {MIN_SAMPLE}）")
+        title_lbl.setStyleSheet(
+            f"color:{ACCENT}; font-weight:bold; font-size:13px;"
+            f" background:transparent; border:none;"
+        )
+        hdr_h.addWidget(title_lbl)
+        fv.addWidget(hdr_w)
+
+        if not known:
+            empty = QLabel("  暂无足够数据")
+            empty.setStyleSheet(f"color:{MUTED}; font-size:12px; padding:10px;")
+            fv.addWidget(empty)
+            return frame
+
+        # 为每条记录预计算各因子标签
+        labeled: list[dict] = []
+        for r in known:
+            lbl_map: dict[str, str] = {}
+            for fid, _, fn in FACTOR_DEFS:
+                v = fn(r)
+                if v is not None:
+                    lbl_map[fid] = v
+            labeled.append({"r": r, "labels": lbl_map})
+
+        candidates: list[tuple] = []  # (desc, grp, prm, rate, combo_key)
+        # combo_key: list of (fid, label_value) 用于对下周数据重新过滤
+
+        def _add_bucket(bucket: dict, desc_fn, key_fn):
+            for key, grp in bucket.items():
+                total = len(grp)
+                if total < MIN_SAMPLE:
+                    continue
+                prm  = sum(1 for r in grp if r["promoted"])
+                rate = prm / total * 100
+                candidates.append((desc_fn(key), grp, prm, rate, key_fn(key)))
+
+        # 单因子
+        for fid, fname, _ in FACTOR_DEFS:
+            bucket: dict[str, list] = {}
+            for item in labeled:
+                lbl = item["labels"].get(fid)
+                if lbl:
+                    bucket.setdefault(lbl, []).append(item["r"])
+            _add_bucket(bucket,
+                        lambda k, fn=fname: f"{fn} · {k}",
+                        lambda k, f=fid:   [(f, k)])
+
+        # 双因子（两两组合）
+        for i in range(len(FACTOR_DEFS)):
+            for j in range(i + 1, len(FACTOR_DEFS)):
+                fid1, fname1, _ = FACTOR_DEFS[i]
+                fid2, fname2, _ = FACTOR_DEFS[j]
+                bucket2: dict[tuple, list] = {}
+                for item in labeled:
+                    l1 = item["labels"].get(fid1)
+                    l2 = item["labels"].get(fid2)
+                    if l1 and l2:
+                        bucket2.setdefault((l1, l2), []).append(item["r"])
+                _add_bucket(bucket2,
+                            lambda k, fn1=fname1, fn2=fname2: f"{fn1} · {k[0]}   +   {fn2} · {k[1]}",
+                            lambda k, f1=fid1, f2=fid2: [(f1, k[0]), (f2, k[1])])
+
+        if not candidates:
+            empty = QLabel("  样本量不足，无法生成组合分析")
+            empty.setStyleSheet(f"color:{MUTED}; font-size:12px; padding:10px;")
+            fv.addWidget(empty)
+            return frame
+
+        candidates.sort(key=lambda x: x[3], reverse=True)
+        top = candidates[:TOP_N]
+
+        # 预计算下周记录的因子标签（用于下周连板率查询）
+        nw_known = [r for r in (next_week_records or []) if r["has_next"]]
+        nw_labeled: list[tuple] = []
+        for r in nw_known:
+            lbl_map: dict[str, str] = {}
+            for fid, _, fn in FACTOR_DEFS:
+                v = fn(r)
+                if v is not None:
+                    lbl_map[fid] = v
+            nw_labeled.append((r, lbl_map))
+
+        ROW_H = 42
+        HDR_H = 30
+
+        tbl_style = f"""
+            QTableWidget {{
+                border: none; background: {BG};
+                alternate-background-color: {SURFACE};
+                color: {TEXT}; font-size: 12px;
+                gridline-color: {BORDER};
+            }}
+            QTableWidget::item {{ padding: 0px; }}
+            QHeaderView::section {{
+                background: {SURFACE}; color: {MUTED}; font-size: 11px;
+                font-weight: bold; border: none;
+                border-right: 1px solid {BORDER};
+                border-bottom: 1px solid {BORDER}; padding: 3px 8px;
+            }}
+        """
+        tbl = QTableWidget(len(top), 4)
+        tbl.setHorizontalHeaderLabels(["排名", "因子组合", "连板率", "下周连板率"])
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setShowGrid(True)
+        tbl.setAlternatingRowColors(True)
+        tbl.setStyleSheet(tbl_style)
+        tbl.verticalHeader().setDefaultSectionSize(ROW_H)
+
+        hdr = tbl.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        tbl.setColumnWidth(2, 190)   # 连板率
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        tbl.setColumnWidth(3, 190)   # 下周连板率
+
+        rank_colors = ["#FFB400", "#AAAAAA", "#CD7F32"]  # 金银铜
+
+        # 因子 → (背景色, 文字色) 胶囊配色
+        fid_to_fname = {fid: fname for fid, fname, _ in FACTOR_DEFS}
+        PILL_COLORS: dict[str, tuple[str, str]] = {
+            "market":        ("#DBEAFE", "#1D4ED8"),
+            "consecutive":   ("#FCE7F3", "#9D174D"),
+            "float_cap":     ("#D1FAE5", "#065F46"),
+            "price":         ("#FEF3C7", "#92400E"),
+            "pe":            ("#EDE9FE", "#5B21B6"),
+            "concentration": ("#CCFBF1", "#134E4A"),
+            "concept":       ("#FFF7ED", "#C2410C"),
+        }
+
+        def _make_combo_widget(combo_key: list, tooltip: str) -> QWidget:
+            w = QWidget()
+            w.setStyleSheet("background:transparent; border:none;")
+            w.setToolTip(tooltip)
+            h = QHBoxLayout(w)
+            h.setContentsMargins(6, 4, 6, 4)
+            h.setSpacing(6)
+            for fid, val in combo_key:
+                fname = fid_to_fname.get(fid, fid)
+                bg, fg = PILL_COLORS.get(fid, ("#F0F0F0", "#333333"))
+                pill = QLabel(f"{fname} · {val}")
+                pill.setStyleSheet(f"""
+                    QLabel {{
+                        background-color: {bg};
+                        color: {fg};
+                        border-radius: 7px;
+                        padding: 0px 8px;
+                        font-size: 11px;
+                        font-weight: bold;
+                        border: none;
+                        max-height: 19px;
+                        min-height: 17px;
+                    }}
+                """)
+                pill.setFixedHeight(19)
+                h.addWidget(pill)
+            h.addStretch()
+            return w
+
+        def _bar_color(rate: float) -> str:
+            if rate >= 60: return GREEN
+            if rate >= 40: return ORANGE
+            return RED
+
+        def _make_mini_bar(rate: float, prm: int, total: int) -> QWidget:
+            r_int = int(round(rate))
+            color = _bar_color(rate)
+            bar_w = QWidget()
+            bar_w.setStyleSheet("background:transparent; border:none;")
+            bar_h = QHBoxLayout(bar_w)
+            bar_h.setContentsMargins(4, 0, 6, 0)
+            bar_h.setSpacing(3)
+            # 个数标签（左侧，灰色小字）
+            cnt_lbl = QLabel(f"{total}")
+            cnt_lbl.setFixedWidth(24)
+            cnt_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            cnt_lbl.setStyleSheet(
+                f"color:{MUTED}; font-size:10px; background:transparent; border:none;"
+            )
+            bar_h.addWidget(cnt_lbl)
+            # 进度条
+            prog = QProgressBar()
+            prog.setRange(0, 100)
+            prog.setValue(r_int)
+            prog.setTextVisible(False)
+            prog.setFixedHeight(7)
+            prog.setStyleSheet(f"""
+                QProgressBar {{ background:{BORDER}; border-radius:3px; border:none; }}
+                QProgressBar::chunk {{ background:{color}; border-radius:3px; min-width:4px; }}
+            """)
+            bar_h.addWidget(prog)
+            # 百分比标签（右侧）
+            pct = QLabel(f"{r_int}%")
+            pct.setFixedWidth(32)
+            pct.setStyleSheet(
+                f"color:{color}; font-weight:bold; font-size:10px;"
+                f" background:transparent; border:none;"
+            )
+            bar_h.addWidget(pct)
+            return bar_w
+
+        for i, (desc, grp, prm, rate, combo_key) in enumerate(top):
+            total = len(grp)
+            tip   = self._stocks_tooltip(grp)
+
+            # 排名
+            rank_item = QTableWidgetItem(f"#{i + 1}")
+            rank_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if i < 3:
+                rank_item.setForeground(QBrush(QColor(rank_colors[i])))
+            tbl.setItem(i, 0, rank_item)
+
+            # 因子组合：胶囊样式
+            tbl.setCellWidget(i, 1, _make_combo_widget(combo_key, tip))
+
+            # 连板率（个数在左）
+            bar_w = _make_mini_bar(rate, prm, total)
+            bar_w.setToolTip(tip)
+            tbl.setCellWidget(i, 2, bar_w)
+
+            # 下周连板率：用 combo_key 过滤下周同因子组合的记录
+            nw_grp = [r for r, lbl in nw_labeled
+                      if all(lbl.get(f) == v for f, v in combo_key)]
+            nw_tip = self._stocks_tooltip(nw_grp) if nw_grp else "（下周无该组合的数据）"
+            if nw_grp:
+                nw_prm  = sum(1 for r in nw_grp if r["promoted"])
+                nw_rate = nw_prm / len(nw_grp) * 100
+                w_wk = _make_mini_bar(nw_rate, nw_prm, len(nw_grp))
+                w_wk.setToolTip(nw_tip)
+                tbl.setCellWidget(i, 3, w_wk)
+            else:
+                no_wk = QLabel("—")
+                no_wk.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                no_wk.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+                tbl.setCellWidget(i, 3, no_wk)
+
+        tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tbl.setFixedHeight(len(top) * ROW_H + HDR_H)
+        fv.addWidget(tbl)
+        return frame
 
     # ── 辅助：构建 section ──
 
@@ -2753,22 +3143,22 @@ class FactorTab(QWidget):
                 sort_val, w = _fill_col(day_recs)
                 tbl.setItem(i, 1 + j, _NumericItem("", sort_val))
                 if w is None:
-                    known = [r for r in day_recs if r["has_next"]]
-                    prm  = sum(1 for r in known if r["promoted"])
-                    rate = prm / len(known) * 100
+                    known_day = [r for r in day_recs if r["has_next"]]
+                    prm  = sum(1 for r in known_day if r["promoted"])
+                    rate = prm / len(known_day) * 100
                     w = _make_bar(rate, len(day_recs))
-                    w.setToolTip(f"涨停 {len(day_recs)} 只，晋级 {prm} 只")
+                w.setToolTip(self._stocks_tooltip(day_recs))
                 tbl.setCellWidget(i, 1 + j, w)
 
             # 合计列
             sort_val, w = _fill_col(all_recs)
             tbl.setItem(i, 1 + n_date_cols, _NumericItem("", sort_val))
             if w is None:
-                known = [r for r in all_recs if r["has_next"]]
-                prm  = sum(1 for r in known if r["promoted"])
-                rate = prm / len(known) * 100
+                known_all = [r for r in all_recs if r["has_next"]]
+                prm  = sum(1 for r in known_all if r["promoted"])
+                rate = prm / len(known_all) * 100
                 w = _make_bar(rate, len(all_recs))
-                w.setToolTip(f"涨停 {len(all_recs)} 只，晋级 {prm} 只")
+            w.setToolTip(self._stocks_tooltip(all_recs))
             tbl.setCellWidget(i, 1 + n_date_cols, w)
 
         tbl.setSortingEnabled(True)
