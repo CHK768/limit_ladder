@@ -980,7 +980,8 @@ class LadderTab(QWidget):
 
         # ── 左侧筛选面板（可垂直滚动）──
         left = QWidget()
-        left.setFixedWidth(220)
+        left.setMinimumWidth(250)
+        left.setMaximumWidth(400)
         left.setStyleSheet(f"background:{SURFACE};")
         _left_outer = QVBoxLayout(left)
         _left_outer.setContentsMargins(0, 0, 0, 0)
@@ -988,7 +989,7 @@ class LadderTab(QWidget):
 
         _left_scroll = QScrollArea()
         _left_scroll.setWidgetResizable(True)
-        _left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        _left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         _left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         _left_scroll.setStyleSheet(
             f"QScrollArea {{ border:none; background:{SURFACE}; }}"
@@ -1123,7 +1124,7 @@ class LadderTab(QWidget):
             f" border:1px solid {ACCENT}; font-weight:bold; }}"
         )
         self._src_all_btn = QPushButton("全部")
-        self._src_em_btn  = QPushButton("东财行业")
+        self._src_em_btn  = QPushButton("东方财富")
         self._src_ths_btn = QPushButton("同花顺")
         for _b in (self._src_all_btn, self._src_em_btn, self._src_ths_btn):
             _b.setCheckable(True)
@@ -1256,7 +1257,7 @@ class LadderTab(QWidget):
 
         main_split.addWidget(left)
         main_split.addWidget(right)
-        main_split.setSizes([220, 9999])
+        main_split.setSizes([250, 9999])
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
