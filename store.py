@@ -115,7 +115,12 @@ def is_fetched(key: str, max_age_hours: float = 12) -> bool:
         row = c.execute(
             "SELECT fetched_at, status FROM fetch_log WHERE key=?", (key,)
         ).fetchone()
-    if row is None or row["status"] != "ok":
+    if row is None:
+        return False
+    # ok_ohlc = 历史日K重建数据，永久有效，不受 max_age_hours 限制
+    if row["status"] == "ok_ohlc":
+        return True
+    if row["status"] != "ok":
         return False
     try:
         t = datetime.fromisoformat(row["fetched_at"])
@@ -432,7 +437,7 @@ def get_dates_with_zt_data() -> list[str]:
     return [r[0] for r in rows]
 
 
-def get_dates_missing_pe(days: int = 90) -> list[str]:
+def get_dates_missing_pe(days: int = 300) -> list[str]:
     """返回最近 N 天内有涨停记录但存在 pe IS NULL 的日期列表（升序）"""
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
     with get_conn() as c:
@@ -505,6 +510,15 @@ def get_cyq_for_dates(dates: list[str]) -> dict[str, dict[str, float]]:
         if r["concentration_90"] is not None:
             result.setdefault(r["date"], {})[r["code"]] = r["concentration_90"]
     return result
+
+
+def get_zt_dates_for_code(code: str) -> list[str]:
+    """返回某股票出现过的涨停日期，降序（最新在前）"""
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT DISTINCT date FROM zt_records WHERE code=? ORDER BY date DESC", (code,)
+        ).fetchall()
+    return [r[0] for r in rows]
 
 
 def get_all_zt_codes() -> list[str]:
