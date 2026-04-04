@@ -543,25 +543,24 @@ def _scale_pe(code: str, date_price: float | None,
 
 def fetch_today_sector_net_buy() -> dict[str, float]:
     """
-    获取今日概念板块主力净买入，返回 {sector_name: 万元}。
-    使用东方财富概念资金流接口（与涨停池所属行业命名一致）。
-    返回值单位：万元（接口原始单位，无需转换）。
-    需要外网访问东方财富（HTTPS）。
+    获取今日板块主力净买入，返回 {sector_name: 元}。
+    同时查询东财「行业资金流」和「概念资金流」，确保与涨停池「所属行业」命名对应。
+    接口返回值单位为元，直接存储。
     """
-    try:
-        df = ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="概念资金流")
-        if df is None or df.empty:
-            return {}
-        result: dict[str, float] = {}
-        for _, row in df.iterrows():
-            name = str(row.get("名称", "")).strip()
-            val = _safe_float(str(row.get("今日主力净流入-净额", "")))
-            if name and val is not None:
-                result[name] = val   # 已是万元，直接存储
-        return result
-    except Exception as e:
-        print(f"fetch_today_sector_net_buy error: {e}")
-        return {}
+    result: dict[str, float] = {}
+    for sector_type in ["行业资金流", "概念资金流"]:
+        try:
+            df = ak.stock_sector_fund_flow_rank(indicator="今日", sector_type=sector_type)
+            if df is None or df.empty:
+                continue
+            for _, row in df.iterrows():
+                name = str(row.get("名称", "")).strip()
+                val = _safe_float(str(row.get("今日主力净流入-净额", "")))
+                if name and val is not None and name not in result:
+                    result[name] = val
+        except Exception as e:
+            print(f"fetch_today_sector_net_buy [{sector_type}] error: {e}")
+    return result
 
 
 # ─────────────────────────── 全量获取入口 ───────────────────────────
