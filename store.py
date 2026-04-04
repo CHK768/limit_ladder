@@ -432,7 +432,7 @@ def get_dates_with_zt_data() -> list[str]:
     return [r[0] for r in rows]
 
 
-def get_dates_missing_pe(days: int = 14) -> list[str]:
+def get_dates_missing_pe(days: int = 90) -> list[str]:
     """返回最近 N 天内有涨停记录但存在 pe IS NULL 的日期列表（升序）"""
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
     with get_conn() as c:
