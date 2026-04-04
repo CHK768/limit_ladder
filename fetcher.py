@@ -964,37 +964,26 @@ def _compute_cyq_concentration(
     return round((pr1 - pr0) / (pr0 + pr1), 4)
 
 
-def _fetch_kline_with_turnover(code: str, n_days: int = 250) -> "pd.DataFrame | None":
+def _fetch_kline_with_turnover(code: str, n_days: int = 500) -> "pd.DataFrame | None":
     """
-    用腾讯日 K JSON 接口获取 OHLCV，再用 zt_records 里的流通市值估算换手率。
-    返回含 open/high/low/close/turnover 列的 DataFrame，失败返回 None。
-    turnover = 日成交量(股) / 流通股数(股)；流通股数 = float_cap(亿元) * 1e8 / price。
+    用腾讯 proxy.finance.qq.com 日K接口获取 OHLCV + 官方换手率（字段[7]，单位%）。
+    返回含 date(YYYYMMDD)/open/high/low/close/turnover 列的 DataFrame（升序），
+    失败返回 None。
+    turnover = 字段[7] / 100（官方换手率，已还原为小数）。
     """
-    from store import get_conn
     import requests as _r
-
-    # 从 zt_records 取最近一次有效的 float_cap + price 来估算流通股数
-    with get_conn() as conn:
-        row = conn.execute(
-            """SELECT float_cap, price FROM zt_records
-               WHERE code=? AND float_cap IS NOT NULL AND price IS NOT NULL
-               ORDER BY date DESC LIMIT 1""",
-            (code,),
-        ).fetchone()
-    if row is None:
-        return None
-    float_cap, price = float(row[0]), float(row[1])
-    if float_cap <= 0 or price <= 0:
-        return None
-    float_shares = float_cap * 1e8 / price   # 流通股数（股）
 
     sym = f"{_market_prefix(code)}{code}"
     url = (
-        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-        f"?param={sym},day,,,{n_days},"
+        f"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+        f"?_var=x&param={sym},day,,,{n_days},&cb=&r=0.1"
     )
     resp = _r.get(url, timeout=10, verify=False)
-    raw = resp.json()
+    text = resp.text
+    # 去掉 JSONP 包装 "x="
+    if text.startswith("x="):
+        text = text[2:]
+    raw = json.loads(text)
     records = raw.get("data", {}).get(sym, {}).get("day", [])
     if not records:
         return None
@@ -1002,13 +991,16 @@ def _fetch_kline_with_turnover(code: str, n_days: int = 250) -> "pd.DataFrame | 
     rows = []
     for r in records:
         try:
-            vol = float(r[5])
+            date_str = str(r[0]).replace("-", "")[:8]
+            # 字段[7] 是官方换手率（%），除以100得小数；字段数<8时回退0
+            turnover_pct = float(r[7]) if len(r) > 7 and r[7] not in ("", None) else 0.0
             rows.append({
+                "date":     date_str,
                 "open":     float(r[1]),
                 "close":    float(r[2]),
                 "high":     float(r[3]),
                 "low":      float(r[4]),
-                "turnover": min(1.0, vol / float_shares) if float_shares > 0 else 0.0,
+                "turnover": min(1.0, turnover_pct / 100.0),
             })
         except (IndexError, ValueError):
             continue
@@ -1021,11 +1013,13 @@ def fetch_and_store_cyq(
     stop_flag=None,
 ) -> int:
     """
-    用腾讯日 K JSON（无 py_mini_racer，QThread 安全）+ zt_records 流通市值估算换手率，
-    再用 CYQCalculator 算法计算90%筹码集中度。
-    写入该股在 zt_records 中出现的所有日期，确保历史卡片能显示。
+    用腾讯日 K JSON + CYQCalculator 为每个涨停日期独立计算筹码集中度。
+    对每只股票取最近500日K线，对其在 zt_records 中每次出现的日期，
+    各自截取该日往前120日的窗口数据单独计算，确保历史日期的集中度
+    反映当时的筹码分布，而非用同一个值代替所有日期。
     """
     from store import get_conn
+    CYQ_WINDOW = 120
     total = 0
     for code in codes:
         if stop_flag and stop_flag():
@@ -1034,23 +1028,48 @@ def fetch_and_store_cyq(
         if is_fetched(key, max_age_hours=max_age_hours):
             continue
         try:
-            df = _fetch_kline_with_turnover(code)
+            df = _fetch_kline_with_turnover(code, n_days=500)
             if df is None or df.empty:
                 continue
-            concentration = _compute_cyq_concentration(df)
-            if concentration is None:
-                continue
+
+            # 建立日期→位置映射，便于按 zt_date 截窗口
+            date_list = list(df["date"])
+            date_to_pos = {d: i for i, d in enumerate(date_list)}
+
             with get_conn() as conn:
                 zt_dates = [r[0] for r in conn.execute(
                     "SELECT DISTINCT date FROM zt_records WHERE code=?", (code,)
                 ).fetchall()]
             if not zt_dates:
                 continue
-            rows = [{"date": d, "code": code, "concentration_90": float(concentration)}
-                    for d in zt_dates]
-            upsert_cyq_records(rows)
-            mark_fetched(key)
-            total += len(rows)
+
+            ohlct_cols = ["open", "close", "high", "low", "turnover"]
+            rows_to_insert = []
+            for zt_date in zt_dates:
+                # 找到 zt_date 对应的 kline 位置（或最近较早的一天）
+                pos = date_to_pos.get(zt_date)
+                if pos is None:
+                    earlier = [i for i, d in enumerate(date_list) if d <= zt_date]
+                    if not earlier:
+                        continue
+                    pos = earlier[-1]
+
+                start = max(0, pos - CYQ_WINDOW + 1)
+                window_df = df.iloc[start: pos + 1][ohlct_cols]
+
+                if len(window_df) < 10:
+                    continue
+                c = _compute_cyq_concentration(window_df)
+                if c is not None:
+                    rows_to_insert.append({
+                        "date": zt_date, "code": code,
+                        "concentration_90": float(c),
+                    })
+
+            if rows_to_insert:
+                upsert_cyq_records(rows_to_insert)
+                mark_fetched(key)
+                total += len(rows_to_insert)
         except Exception as e:
             print(f"fetch_cyq {code}: {e}")
         time.sleep(0.1)
