@@ -2264,6 +2264,521 @@ class SectorTab(QWidget):
                 self._rebuild()
 
 
+# ──────────────────────────────── 因子分析 Tab ────────────────────────────────
+
+class FactorTab(QWidget):
+    """因子分析 Tab：分析指定5天连板个股各因子与连板率的关系"""
+
+    DAYS = 5
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._all_dates: list[str] = []
+        self._page_offset: int = 0
+        self._setup_ui()
+
+    # ── UI ──
+
+    def _setup_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 8, 12, 12)
+        root.setSpacing(6)
+
+        # 导航栏（与板块日统计相同风格）
+        nav = QHBoxLayout()
+        self._prev_btn = QPushButton("◀  更新")
+        self._next_btn = QPushButton("更早  ▶")
+        for btn in (self._prev_btn, self._next_btn):
+            btn.setStyleSheet(
+                f"QPushButton {{ background:{SEL}; color:{TEXT}; border:none;"
+                f" border-radius:5px; padding:5px 14px; font-size:12px; }}"
+            )
+            btn.setFixedHeight(28)
+        self._prev_btn.clicked.connect(self._page_next)
+        self._next_btn.clicked.connect(self._page_prev)
+        self._date_btn = QPushButton("—")
+        self._date_btn.setFlat(True)
+        self._date_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._date_btn.setToolTip("点击选择日期")
+        self._date_btn.setStyleSheet(
+            f"QPushButton {{ color:{MUTED}; font-size:11px; background:transparent; border:none; }}"
+            f"QPushButton:hover {{ color:{ACCENT}; text-decoration:underline; }}"
+        )
+        self._date_btn.clicked.connect(self._show_date_picker)
+        nav.addWidget(self._prev_btn)
+        nav.addStretch()
+        nav.addWidget(self._date_btn)
+        nav.addStretch()
+        nav.addWidget(self._next_btn)
+        nav_frame = QFrame()
+        nav_frame.setStyleSheet(f"background:{SURFACE}; border-bottom:1px solid {BORDER};")
+        nav_frame.setLayout(nav)
+        root.addWidget(nav_frame)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet(f"QScrollArea {{ border:none; background:{BG}; }}")
+        root.addWidget(self._scroll, 1)
+
+    # ── 导航 ──
+
+    def _page_prev(self):
+        new_off = self._page_offset + self.DAYS
+        if new_off < len(self._all_dates):
+            self._page_offset = new_off
+            self._rebuild()
+
+    def _page_next(self):
+        new_off = max(0, self._page_offset - self.DAYS)
+        self._page_offset = new_off
+        self._rebuild()
+
+    def _show_date_picker(self):
+        dlg = _DatePickerDialog(self._all_dates, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            chosen = dlg.selected_date()
+            if chosen and chosen in self._all_dates:
+                self._page_offset = self._all_dates.index(chosen)
+                self._rebuild()
+
+    # ── 数据 ──
+
+    def load_data(self, all_dates: list[str]):
+        self._all_dates = all_dates
+        self._page_offset = 0
+        self._rebuild()
+
+    def _rebuild(self):
+        # 每次重建时替换 scroll 内的 widget（旧的会被 Qt 自动销毁）
+        content = QWidget()
+        content.setStyleSheet(f"background:{BG};")
+        grid = QGridLayout(content)
+        grid.setSpacing(12)
+        grid.setContentsMargins(0, 4, 0, 16)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+
+        if not self._all_dates:
+            self._date_btn.setText("—")
+            self._scroll.setWidget(content)
+            return
+
+        # 当前页日期（all_dates 降序，page_offset 起的 DAYS 天）
+        start = self._page_offset
+        end   = min(len(self._all_dates), start + self.DAYS)
+        analysis_dates = self._all_dates[start:end]
+
+        # 更新导航标签
+        self._date_btn.setText(f"{analysis_dates[-1]} ~ {analysis_dates[0]}")
+        self._prev_btn.setEnabled(self._page_offset > 0)
+        self._next_btn.setEnabled(end < len(self._all_dates))
+
+        # 最新日晋级判断：需要 page_offset 前一格（更新的那天）
+        extra_recent: list[str] = []
+        if self._page_offset > 0:
+            extra_recent = [self._all_dates[self._page_offset - 1]]
+
+        fetch_dates = list(analysis_dates) + extra_recent
+        zt_by_date  = store.get_zt_for_dates(fetch_dates)
+        cyq_by_date = store.get_cyq_for_dates(fetch_dates)
+
+        all_codes: set[str] = set()
+        for d in analysis_dates:
+            for row in zt_by_date.get(d, []):
+                all_codes.add(row["code"])
+
+        concept_map = store.get_stock_concepts(list(all_codes))
+
+        # 构建 (date, code) 记录，analysis_dates 是 DESC
+        # "下一交易日（更新）" = analysis_dates[i-1]（i>0），最新日用 extra_recent
+        records: list[dict] = []
+        for i, d in enumerate(analysis_dates):
+            if i == 0:
+                if extra_recent:
+                    next_codes = {r["code"] for r in zt_by_date.get(extra_recent[0], [])}
+                    has_next = True
+                else:
+                    next_codes = set()
+                    has_next = False
+            else:
+                next_codes = {r["code"] for r in zt_by_date.get(analysis_dates[i - 1], [])}
+                has_next = True
+
+            for row in zt_by_date.get(d, []):
+                code = row["code"]
+                if code.startswith(("43", "83", "87", "92")):
+                    market = "北交所"
+                elif code.startswith(("300", "301")):
+                    market = "创业板"
+                elif code.startswith("688"):
+                    market = "科创板"
+                else:
+                    market = "主板"
+
+                records.append({
+                    "date":          d,
+                    "code":          code,
+                    "market":        market,
+                    "float_cap":     row.get("float_cap"),
+                    "price":         row.get("price"),
+                    "pe":            row.get("pe"),
+                    "consecutive":   row.get("consecutive_days", 1),
+                    "concentration": cyq_by_date.get(d, {}).get(code),
+                    "concepts":      concept_map.get(code, []),
+                    "promoted":      (code in next_codes) if has_next else None,
+                    "has_next":      has_next,
+                })
+
+        known_date_set = {r["date"] for r in records if r["has_next"]}
+        known = [r for r in records if r["has_next"]]
+
+        if not known:
+            lbl = QLabel("暂无足够数据（至少需要 2 个交易日数据）")
+            lbl.setStyleSheet(f"color:{MUTED}; font-size:13px; padding:20px;")
+            grid.addWidget(lbl, 0, 0, 1, 3)
+            grid.setRowStretch(1, 1)
+            self._scroll.setWidget(content)
+            return
+
+        # 信息头
+        info = QLabel(f"共 {len(known)} 条有效记录  ·  连板率 = 次日继续涨停的概率")
+        info.setStyleSheet(f"color:{MUTED}; font-size:11px; padding:2px 0 6px 0;")
+        grid.addWidget(info, 0, 0, 1, 2)
+
+        # col_dates: 列顺序用时间升序（左旧右新），analysis_dates 是 DESC 需要反转
+        col_dates = list(reversed(analysis_dates))
+        kw = dict(col_dates=col_dates, known_date_set=known_date_set)
+
+        # 构建各 section（row builder 传全量 records，section 内部按日期拆分）
+        s_market  = self._build_section("市场板块",          self._rows_market(records), **kw)
+        s_consec  = self._build_section("连板数",             self._rows_consecutive(records), **kw)
+        s_price   = self._build_section("股价（元）",         self._rows_price(records), **kw)
+        s_fcap    = self._build_section("流通市值",           self._rows_float_cap(records), **kw)
+        s_pe      = self._build_section("市盈率 PE",          self._rows_pe(records), **kw)
+        s_cyq     = self._build_section("筹码集中度 90%",     self._rows_concentration(records), **kw)
+        s_concept = self._build_section("概念板块（Top 15）", self._rows_concept(records), **kw)
+
+        # 2 列网格排列（AlignTop 确保各格子顶部对齐，不被拉伸）
+        AT = Qt.AlignmentFlag.AlignTop
+        grid.addWidget(s_market,  1, 0, AT)
+        grid.addWidget(s_consec,  1, 1, AT)
+        grid.addWidget(s_price,   2, 0, AT)
+        grid.addWidget(s_fcap,    2, 1, AT)
+        grid.addWidget(s_pe,      3, 0, AT)
+        grid.addWidget(s_cyq,     3, 1, AT)
+        grid.addWidget(s_concept, 4, 0, 1, 2)   # 概念独占一整行
+        grid.setRowStretch(5, 1)
+
+        self._scroll.setWidget(content)
+
+    # ── 辅助：统计 ──
+
+    @staticmethod
+    def _rate(grp: list[dict]) -> tuple[int, int, float]:
+        """(total, promoted_count, rate_pct)"""
+        total = len(grp)
+        promoted = sum(1 for r in grp if r["promoted"])
+        return total, promoted, (promoted / total * 100) if total else 0.0
+
+    @staticmethod
+    def _pearson(records: list[dict], key: str) -> float | None:
+        vals = [(r[key], 1 if r["promoted"] else 0)
+                for r in records if r[key] is not None]
+        if len(vals) < 5:
+            return None
+        n = len(vals)
+        xs = [v[0] for v in vals]
+        ys = [v[1] for v in vals]
+        mx, my = sum(xs) / n, sum(ys) / n
+        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        den = (sum((x - mx) ** 2 for x in xs) * sum((y - my) ** 2 for y in ys)) ** 0.5
+        return num / den if den else None
+
+    # ── 辅助：各因子分组（返回 [(label, [records])]）──
+
+    def _rows_market(self, records: list[dict]) -> list[tuple]:
+        groups: dict[str, list] = {}
+        for r in records:
+            groups.setdefault(r["market"], []).append(r)
+        return [(m, groups[m]) for m in ["主板", "创业板", "科创板", "北交所"] if m in groups]
+
+    def _rows_consecutive(self, records: list[dict]) -> list[tuple]:
+        groups: dict[int, list] = {}
+        for r in records:
+            groups.setdefault(r["consecutive"], []).append(r)
+        return [(f"{d}板", groups[d]) for d in sorted(groups)]
+
+    def _rows_float_cap(self, records: list[dict]) -> list[tuple]:
+        bins = [
+            ("< 20亿",    lambda v: v < 20),
+            ("20~50亿",   lambda v: 20 <= v < 50),
+            ("50~100亿",  lambda v: 50 <= v < 100),
+            ("100~300亿", lambda v: 100 <= v < 300),
+            ("300~500亿", lambda v: 300 <= v < 500),
+            ("> 500亿",   lambda v: v >= 500),
+        ]
+        return self._bin_rows(records, "float_cap", bins)
+
+    def _rows_price(self, records: list[dict]) -> list[tuple]:
+        bins = [
+            ("< 10元",    lambda v: v < 10),
+            ("10~20元",   lambda v: 10 <= v < 20),
+            ("20~50元",   lambda v: 20 <= v < 50),
+            ("50~100元",  lambda v: 50 <= v < 100),
+            ("> 100元",   lambda v: v >= 100),
+        ]
+        return self._bin_rows(records, "price", bins)
+
+    def _rows_pe(self, records: list[dict]) -> list[tuple]:
+        bins = [
+            ("亏损(PE<0)", lambda v: v < 0),
+            ("0~30",       lambda v: 0 <= v < 30),
+            ("30~60",      lambda v: 30 <= v < 60),
+            ("60~100",     lambda v: 60 <= v < 100),
+            ("100~200",    lambda v: 100 <= v < 200),
+            ("> 200",      lambda v: v >= 200),
+        ]
+        rows = self._bin_rows(records, "pe", bins)
+        no_pe = [r for r in records if r["pe"] is None]
+        if no_pe:
+            rows.append(("无PE数据", no_pe))
+        return rows
+
+    def _rows_concentration(self, records: list[dict]) -> list[tuple]:
+        # concentration_90 存储为小数：0.08 = 8%
+        bins = [
+            ("≤ 3%",   lambda v: v <= 0.03),
+            ("3~8%",   lambda v: 0.03 < v <= 0.08),
+            ("8~15%",  lambda v: 0.08 < v <= 0.15),
+            ("15~20%", lambda v: 0.15 < v <= 0.20),
+            ("20~30%", lambda v: 0.20 < v <= 0.30),
+            ("> 30%",  lambda v: v > 0.30),
+        ]
+        rows = self._bin_rows(records, "concentration", bins)
+        no_cyq = [r for r in records if r["concentration"] is None]
+        if no_cyq:
+            rows.append(("无数据", no_cyq))
+        return rows
+
+    def _rows_concept(self, records: list[dict]) -> list[tuple]:
+        bucket: dict[str, list] = {}
+        for r in records:
+            for c in r["concepts"]:
+                bucket.setdefault(c, []).append(r)
+        top = sorted(bucket.items(), key=lambda x: len(x[1]), reverse=True)[:15]
+        return list(top)
+
+    @staticmethod
+    def _bin_rows(records: list[dict], key: str, bins: list[tuple]) -> list[tuple]:
+        rows = []
+        for label, fn in bins:
+            grp = [r for r in records if r[key] is not None and fn(r[key])]
+            if grp:
+                rows.append((label, grp))
+        return rows
+
+    # ── 辅助：构建 section ──
+
+    def _build_section(self, title: str, rows: list[tuple],
+                        col_dates: list[str], known_date_set: set[str]) -> QFrame:
+        """
+        rows: [(label, [records]), ...]
+        col_dates: 按时间升序的日期列表（左旧右新）
+        known_date_set: 有 has_next=True 数据的日期集合
+        列布局: 分组 | D1 | D2 | ... | Dn | 合计
+        每格显示 "率%(N)" 若已知，"N只" 若无晋级数据，"—" 若无股票
+        """
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame {{ background:{BG}; border:1px solid {BORDER}; border-radius:8px; }}"
+        )
+        fv = QVBoxLayout(frame)
+        fv.setContentsMargins(0, 0, 0, 0)
+        fv.setSpacing(0)
+
+        # 标题行
+        hdr_w = QWidget()
+        hdr_w.setStyleSheet(
+            f"background:{SURFACE}; border-radius:8px 8px 0 0;"
+            f" border-bottom:1px solid {BORDER};"
+        )
+        hdr_h = QHBoxLayout(hdr_w)
+        hdr_h.setContentsMargins(12, 8, 12, 8)
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet(
+            f"color:{TEXT}; font-weight:bold; font-size:13px;"
+            f" background:transparent; border:none;"
+        )
+        hdr_h.addWidget(title_lbl)
+        fv.addWidget(hdr_w)
+
+        if not rows:
+            empty = QLabel("  暂无数据")
+            empty.setStyleSheet(f"color:{MUTED}; font-size:12px; padding:8px;")
+            fv.addWidget(empty)
+            return frame
+
+        # 列：分组 + 每日 + 合计
+        n_date_cols = len(col_dates)
+        total_cols  = 1 + n_date_cols + 1
+
+        def date_hdr(d: str) -> str:
+            # YYYYMMDD → MM/DD，已知晋级日加星标
+            label = f"{d[4:6]}/{d[6:8]}"
+            return label if d in known_date_set else f"{label}*"
+
+        headers = ["分组"] + [date_hdr(d) for d in col_dates] + ["合计"]
+
+        ROW_H = 36
+        HDR_H = 30
+
+        def _bar_color(rate: float) -> str:
+            if rate >= 60:
+                return GREEN
+            if rate >= 40:
+                return ORANGE
+            if rate >= 20:
+                return "#D97706"
+            return RED
+
+        def _make_bar(rate: float, count: int) -> QWidget:
+            """N只  ━━━━━━░░░  60%
+            count 标签固定宽，生命条 Expanding 自动填满列宽，无胶囊边框。
+            """
+            r = max(0, min(100, int(round(rate))))
+            color = _bar_color(rate)
+
+            w = QWidget()
+            w.setStyleSheet("background:transparent; border:none;")
+            h = QHBoxLayout(w)
+            h.setContentsMargins(4, 0, 6, 0)
+            h.setSpacing(3)
+
+            cnt_lbl = QLabel(f"{count}")
+            cnt_lbl.setFixedWidth(22)
+            cnt_lbl.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            cnt_lbl.setStyleSheet(
+                f"color:{MUTED}; font-size:10px;"
+                f" background:transparent; border:none;"
+            )
+            h.addWidget(cnt_lbl)
+
+            hp_bar = QProgressBar()
+            hp_bar.setRange(0, 100)
+            hp_bar.setValue(r)
+            hp_bar.setTextVisible(False)
+            hp_bar.setFixedHeight(7)
+            hp_bar.setMinimumWidth(20)
+            hp_bar.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            )
+            hp_bar.setStyleSheet(f"""
+                QProgressBar {{
+                    background: {BORDER}; border-radius: 3px; border: none;
+                }}
+                QProgressBar::chunk {{
+                    background: {color}; border-radius: 3px; min-width: 4px;
+                }}
+            """)
+            h.addWidget(hp_bar)
+
+            pct_lbl = QLabel(f"{r}%")
+            pct_lbl.setFixedWidth(26)
+            pct_lbl.setStyleSheet(
+                f"color:{color}; font-size:10px; font-weight:bold;"
+                f" background:transparent; border:none;"
+            )
+            h.addWidget(pct_lbl)
+            return w
+
+        def _no_data_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+            return lbl
+
+        def _fill_col(grp: list[dict]) -> tuple[float, QWidget]:
+            """返回 (sort_val, cell_widget)"""
+            known = [r for r in grp if r["has_next"]]
+            total = len(grp)
+            if total == 0:
+                return -1.0, _no_data_label("—")
+            if not known:
+                return -1.0, _no_data_label(f"{total}只")
+            prm  = sum(1 for r in known if r["promoted"])
+            rate = prm / len(known) * 100
+            return rate, None   # widget 由调用方决定 dim
+
+        tbl_style = f"""
+            QTableWidget {{
+                border: none; background: {BG};
+                alternate-background-color: {SURFACE};
+                color: {TEXT}; font-size: 12px;
+                gridline-color: {BORDER};
+            }}
+            QTableWidget::item {{ padding: 0px; }}
+            QHeaderView::section {{
+                background: {SURFACE}; color: {MUTED}; font-size: 11px;
+                font-weight: bold; border: none;
+                border-right: 1px solid {BORDER};
+                border-bottom: 1px solid {BORDER}; padding: 3px 8px;
+            }}
+        """
+        tbl = QTableWidget(len(rows), total_cols)
+        tbl.setHorizontalHeaderLabels(headers)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setShowGrid(True)
+        tbl.setAlternatingRowColors(True)
+        tbl.setStyleSheet(tbl_style)
+
+        hdr = tbl.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for c in range(1, total_cols):
+            hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
+
+        tbl.verticalHeader().setDefaultSectionSize(ROW_H)
+
+        tbl.setSortingEnabled(False)
+        for i, (label, all_recs) in enumerate(rows):
+            tbl.setItem(i, 0, QTableWidgetItem(str(label)))
+
+            # 每日列（浅色条）
+            for j, d in enumerate(col_dates):
+                day_recs = [r for r in all_recs if r["date"] == d]
+                sort_val, w = _fill_col(day_recs)
+                tbl.setItem(i, 1 + j, _NumericItem("", sort_val))
+                if w is None:
+                    known = [r for r in day_recs if r["has_next"]]
+                    prm  = sum(1 for r in known if r["promoted"])
+                    rate = prm / len(known) * 100
+                    w = _make_bar(rate, len(day_recs))
+                    w.setToolTip(f"涨停 {len(day_recs)} 只，晋级 {prm} 只")
+                tbl.setCellWidget(i, 1 + j, w)
+
+            # 合计列
+            sort_val, w = _fill_col(all_recs)
+            tbl.setItem(i, 1 + n_date_cols, _NumericItem("", sort_val))
+            if w is None:
+                known = [r for r in all_recs if r["has_next"]]
+                prm  = sum(1 for r in known if r["promoted"])
+                rate = prm / len(known) * 100
+                w = _make_bar(rate, len(all_recs))
+                w.setToolTip(f"涨停 {len(all_recs)} 只，晋级 {prm} 只")
+            tbl.setCellWidget(i, 1 + n_date_cols, w)
+
+        tbl.setSortingEnabled(True)
+        tbl.sortByColumn(n_date_cols + 1, Qt.SortOrder.DescendingOrder)
+        tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tbl.setFixedHeight(len(rows) * ROW_H + HDR_H)
+        fv.addWidget(tbl)
+        return frame
+
+
 # ──────────────────────────────── 主窗口 ────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -2378,8 +2893,10 @@ class MainWindow(QMainWindow):
         self._ladder_tab = LadderTab()
         self._ladder_tab.status_msg.connect(self._set_status)
         self._sector_tab = SectorTab()
+        self._factor_tab = FactorTab()
         self._tabs.addTab(self._ladder_tab, "连板天梯")
         self._tabs.addTab(self._sector_tab, "板块日统计")
+        self._tabs.addTab(self._factor_tab, "因子分析")
         cv.addWidget(self._tabs, 1)
 
     def _set_status(self, msg: str):
@@ -2402,6 +2919,7 @@ class MainWindow(QMainWindow):
                 self._ladder_tab.set_concepts(concepts)
             self._ladder_tab.load_data(cached_dates)
             self._sector_tab.load_data(cached_dates)
+            self._factor_tab.load_data(cached_dates)
             self._set_status(f"已显示 {len(cached_dates)} 个缓存日期，后台拉取新数据...")
         else:
             self._set_status("正在后台拉取数据，首次启动需要几分钟...")
@@ -2438,6 +2956,7 @@ class MainWindow(QMainWindow):
             # 行业数据已在涨停池拉取时同步写入 stock_concepts，先算板块统计
             self._start_sector_stats(all_dates[:30])
 
+        self._factor_tab.load_data(all_dates)
         self._set_status(f"已加载 {len(all_dates)} 个交易日数据")
         self._ladder_tab._refresh_sys_info()
 
@@ -2465,6 +2984,7 @@ class MainWindow(QMainWindow):
         all_dates = store.get_dates_with_zt_data()
         self._ladder_tab.load_data(all_dates)
         self._sector_tab.load_data(all_dates)
+        self._factor_tab.load_data(all_dates)
         self._set_status(f"历史数据就绪（{len(all_dates)} 个交易日），正在加载概念...")
         if not store.has_concept_data():
             self._start_concept_fetch()
@@ -2489,6 +3009,7 @@ class MainWindow(QMainWindow):
         self._ladder_tab.set_concepts(concepts)
         all_dates = store.get_dates_with_zt_data()
         self._ladder_tab.load_data(all_dates)  # 重新加载以附加概念
+        self._factor_tab.load_data(all_dates)
         self._start_sector_stats(all_dates[:30])
         self._set_status(f"概念数据加载完成，共 {len(concepts)} 个板块")
 
@@ -2517,6 +3038,7 @@ class MainWindow(QMainWindow):
         if concepts:
             self._ladder_tab.set_concepts(concepts)
         self._ladder_tab.load_data(all_dates)  # 刷新以显示新概念
+        self._factor_tab.load_data(all_dates)
         self._set_status("就绪")
 
     def _start_full_refresh(self):
